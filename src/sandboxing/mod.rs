@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-#[cfg(target_os = "macos")]
 pub mod seatbelt;
 
 #[cfg(target_os = "macos")]
@@ -241,18 +240,27 @@ pub struct SandboxExecRequest {
     pub file_system_policy: FileSystemSandboxPolicy,
     pub network_policy: NetworkSandboxPolicy,
     pub arg0: Option<String>,
+    execution: PreparedExecution,
+}
+
+#[derive(Debug)]
+struct PreparedExecution {
+    command: Vec<String>,
+    cwd: PathBuf,
+    env: HashMap<String, String>,
+    sandbox: SandboxType,
 }
 
 impl SandboxExecRequest {
     /// Spawn the transformed command through the selected sandbox backend.
     pub fn spawn(&self) -> Result<Child, SandboxExecutionError> {
-        if self.command.is_empty() {
+        if self.execution.command.is_empty() {
             return Err(SandboxExecutionError::InvalidCommand(
                 "sandbox command is empty".to_string(),
             ));
         }
 
-        match self.sandbox {
+        match self.execution.sandbox {
             #[cfg(target_os = "linux")]
             SandboxType::LinuxSeccomp => {
                 crate::linux_sandbox::ensure_bwrap_support()
@@ -296,18 +304,26 @@ impl SandboxExecRequest {
     }
 
     fn spawn_transformed(&self) -> Result<Child, SandboxExecutionError> {
-        let mut command = Command::new(&self.command[0]);
-        command.args(&self.command[1..]).current_dir(&self.cwd);
+        self.command_for_spawn()
+            .spawn()
+            .map_err(SandboxExecutionError::Io)
+    }
+
+    fn command_for_spawn(&self) -> Command {
+        let mut command = Command::new(&self.execution.command[0]);
+        command
+            .args(&self.execution.command[1..])
+            .current_dir(&self.execution.cwd);
         command.stdin(Stdio::inherit());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
         command.env_clear();
-        for (key, value) in &self.env {
+        for (key, value) in &self.execution.env {
             if !is_unsafe_environment_key(key) {
                 command.env(key, value);
             }
         }
-        command.spawn().map_err(SandboxExecutionError::Io)
+        command
     }
 }
 
@@ -317,6 +333,7 @@ pub enum SandboxTransformError {
     BubblewrapUnavailable,
     BubblewrapBuild(String),
     UnprotectedExecution,
+    UnsupportedPolicy(String),
     #[cfg(not(target_os = "macos"))]
     SeatbeltUnavailable,
     PlatformNotSupported,
@@ -336,6 +353,9 @@ impl std::fmt::Display for SandboxTransformError {
                     f,
                     "unprotected execution is not allowed through the sandbox API"
                 )
+            }
+            Self::UnsupportedPolicy(reason) => {
+                write!(f, "sandbox policy is unsupported: {reason}")
             }
             #[cfg(not(target_os = "macos"))]
             Self::SeatbeltUnavailable => write!(f, "seatbelt sandbox is only available on macOS"),
@@ -467,10 +487,10 @@ impl SandboxManager {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "freebsd", target_os = "openbsd"))]
         let _ = (&cwd, &argv);
 
-        let (argv, arg0_override) = match sandbox {
+        let (argv, arg0_override): (Vec<String>, Option<String>) = match sandbox {
             SandboxType::None => Err(SandboxTransformError::UnprotectedExecution),
             #[cfg(target_os = "macos")]
             SandboxType::MacosSeatbelt => {
@@ -481,7 +501,8 @@ impl SandboxManager {
                     &cwd,
                     false,
                     None,
-                );
+                )
+                .map_err(|error| SandboxTransformError::UnsupportedPolicy(error.to_string()))?;
                 let mut full_command = vec![MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string()];
                 full_command.extend(args);
                 Ok((full_command, None))
@@ -505,14 +526,20 @@ impl SandboxManager {
         }?;
 
         Ok(SandboxExecRequest {
-            command: argv,
-            cwd,
-            env,
+            command: argv.clone(),
+            cwd: cwd.clone(),
+            env: env.clone(),
             sandbox,
             sandbox_policy: policy.clone(),
             file_system_policy: policy.filesystem_policy(),
             network_policy: policy.network_policy(),
             arg0: arg0_override,
+            execution: PreparedExecution {
+                command: argv,
+                cwd,
+                env,
+                sandbox,
+            },
         })
     }
 }
@@ -601,6 +628,55 @@ fn create_linux_sandbox_args(_policy: &SandboxPolicy, _cwd: &Path) -> Vec<String
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutated_public_request_fields_cannot_change_spawned_command() {
+        let mut env = HashMap::new();
+        env.insert("PLAN_VALUE".to_string(), "original".to_string());
+        let mut request = SandboxExecRequest {
+            command: vec!["/bin/true".to_string()],
+            cwd: PathBuf::from("/"),
+            env: env.clone(),
+            sandbox: SandboxType::LinuxSeccomp,
+            sandbox_policy: SandboxPolicy::default(),
+            file_system_policy: FileSystemSandboxPolicy::ReadOnly,
+            network_policy: NetworkSandboxPolicy::NoAccess,
+            arg0: None,
+            execution: PreparedExecution {
+                command: vec!["/usr/bin/printf".to_string(), "safe".to_string()],
+                cwd: PathBuf::from("/"),
+                env,
+                sandbox: SandboxType::LinuxSeccomp,
+            },
+        };
+
+        request.command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "unsafe".to_string(),
+        ];
+        request.cwd = PathBuf::from("/tmp");
+        request.env.clear();
+        request.sandbox = SandboxType::None;
+
+        let command = request.command_for_spawn();
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/usr/bin/printf")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("safe")]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("PLAN_VALUE"))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("original"))
+        );
+        assert_eq!(request.execution.sandbox, SandboxType::LinuxSeccomp);
+    }
 
     #[test]
     fn test_get_platform_sandbox() {

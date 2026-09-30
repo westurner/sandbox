@@ -6,6 +6,7 @@
 
 #[allow(unused_imports)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Path to the macOS sandbox-exec executable
@@ -36,19 +37,12 @@ const MACOS_RESTRICTED_READ_ONLY_POLICY: &str = r#"
 
 fn is_loopback_host(host: &str) -> bool {
     let host_lower = host.to_lowercase();
-    // Check standard localhost variants
-    host_lower == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        // Check IPv6 localhost variants
-        || host_lower == "localhost6"
-        || host_lower == "ip6-localhost"
-        // Check IPv4 loopback (127.0.0.0/8)
-        || host.starts_with("127.")
-        // Check IPv6 loopback variants
-        || host == "0:0:0:0:0:0:0:1"
-        || host == "0:0:0:0:0:0:0:0"
-        || host.contains("::1")
+    matches!(
+        host_lower.as_str(),
+        "localhost" | "localhost6" | "ip6-localhost"
+    ) || host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn proxy_scheme_default_port(scheme: &str) -> u16 {
@@ -115,9 +109,29 @@ pub fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16> 
     ports.into_iter().collect()
 }
 
-/// Create Seatbelt policy string from sandbox policy
-pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
-    match policy {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SeatbeltPolicyError {
+    #[error("Seatbelt cannot enforce the requested proxy network policy")]
+    UnsupportedProxyNetworkPolicy,
+    #[error("Seatbelt cannot enforce the requested external-sandbox network policy")]
+    UnsupportedExternalNetworkPolicy,
+}
+
+/// Create Seatbelt policy string from sandbox policy.
+pub fn create_seatbelt_policy(
+    policy: &super::SandboxPolicy,
+) -> Result<String, SeatbeltPolicyError> {
+    let network_policy = policy.network_policy();
+    if matches!(network_policy, super::NetworkSandboxPolicy::Proxy) {
+        return Err(SeatbeltPolicyError::UnsupportedProxyNetworkPolicy);
+    }
+    if matches!(policy, super::SandboxPolicy::ExternalSandbox { .. })
+        && matches!(network_policy, super::NetworkSandboxPolicy::Localhost)
+    {
+        return Err(SeatbeltPolicyError::UnsupportedExternalNetworkPolicy);
+    }
+
+    Ok(match policy {
         super::SandboxPolicy::DangerFullAccess => {
             // No restrictions
             "(version 1)".to_string()
@@ -149,10 +163,7 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
                     sbpl.push_str("(allow network* (local ip \"127.0.0.1\"))\n");
                     sbpl.push_str("(allow network* (local ip \"::1\"))\n");
                 }
-                super::NetworkSandboxPolicy::Proxy => {
-                    // For proxy, we'll generate dynamic rules based on env
-                    sbpl.push_str("(allow network*)\n");
-                }
+                super::NetworkSandboxPolicy::Proxy => unreachable!("proxy policy rejected above"),
             }
 
             sbpl
@@ -161,6 +172,9 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
             let mut sbpl = String::from("(version 1)\n");
             sbpl.push_str(match network_access {
                 super::NetworkSandboxPolicy::NoAccess => "(deny network*)\n",
+                super::NetworkSandboxPolicy::Localhost => {
+                    unreachable!("external localhost policy rejected above")
+                }
                 _ => "",
             });
             sbpl
@@ -199,14 +213,12 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
                     sbpl.push_str("(allow network* (local ip \"127.0.0.1\"))\n");
                     sbpl.push_str("(allow network* (local ip \"::1\"))\n");
                 }
-                super::NetworkSandboxPolicy::Proxy => {
-                    sbpl.push_str("(allow network*)\n");
-                }
+                super::NetworkSandboxPolicy::Proxy => unreachable!("proxy policy rejected above"),
             }
 
             sbpl
         }
-    }
+    })
 }
 
 /// Create Seatbelt command arguments from policy
@@ -217,7 +229,7 @@ pub fn create_seatbelt_command_args_for_policies(
     _cwd: &Path,
     _enforce_managed_network: bool,
     _network: Option<&()>,
-) -> Vec<String> {
+) -> Result<Vec<String>, SeatbeltPolicyError> {
     let policy = match file_system_policy {
         super::FileSystemSandboxPolicy::WorkspaceWrite { writable_roots } => {
             super::SandboxPolicy::WorkspaceWrite {
@@ -231,13 +243,13 @@ pub fn create_seatbelt_command_args_for_policies(
         },
     };
 
-    let policy_string = create_seatbelt_policy(&policy);
+    let policy_string = create_seatbelt_policy(&policy)?;
 
     let mut args = vec!["-p".to_string(), policy_string];
     args.push("--".to_string());
     args.extend(argv);
 
-    args
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -251,7 +263,7 @@ mod tests {
             network_access: super::super::NetworkSandboxPolicy::NoAccess,
         };
 
-        let sbpl = create_seatbelt_policy(&policy);
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
         assert!(sbpl.contains("(deny default)"));
         assert!(sbpl.contains("(allow file-read*)"));
     }
@@ -279,7 +291,7 @@ mod tests {
             network_access: super::super::NetworkSandboxPolicy::Localhost,
         };
 
-        let sbpl = create_seatbelt_policy(&policy);
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
         // Localhost policy should restrict to specific loopback addresses
         assert!(sbpl.contains("127.0.0.1"));
         assert!(sbpl.contains("::1"));
@@ -294,7 +306,7 @@ mod tests {
             network_access: super::super::NetworkSandboxPolicy::NoAccess,
         };
 
-        let sbpl = create_seatbelt_policy(&policy);
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
         // No network should not contain network allow rules
         assert!(!sbpl.contains("(allow network"));
     }
@@ -306,7 +318,7 @@ mod tests {
             network_access: super::super::NetworkSandboxPolicy::FullAccess,
         };
 
-        let sbpl = create_seatbelt_policy(&policy);
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
         // FullAccess should allow all network
         assert!(sbpl.contains("(allow network*)"));
     }
@@ -318,12 +330,58 @@ mod tests {
             network_access: super::super::NetworkSandboxPolicy::Localhost,
         };
 
-        let sbpl = create_seatbelt_policy(&policy);
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
         // Should allow file write to /tmp
         assert!(sbpl.contains("/tmp"));
         // Should restrict localhost
         assert!(sbpl.contains("127.0.0.1"));
         assert!(sbpl.contains("::1"));
+    }
+
+    #[test]
+    fn proxy_policy_fails_closed_instead_of_allowing_all_network() {
+        let policy = super::super::SandboxPolicy::ReadOnly {
+            file_system: super::super::FileSystemSandboxPolicy::ReadOnly,
+            network_access: super::super::NetworkSandboxPolicy::Proxy,
+        };
+
+        assert_eq!(
+            create_seatbelt_policy(&policy),
+            Err(SeatbeltPolicyError::UnsupportedProxyNetworkPolicy)
+        );
+    }
+
+    #[test]
+    fn mock_seatbelt_launcher_receives_literal_argv() {
+        let args = create_seatbelt_command_args_for_policies(
+            vec!["tool".to_string(), "$(not-a-shell)".to_string()],
+            &super::super::FileSystemSandboxPolicy::ReadOnly,
+            super::super::NetworkSandboxPolicy::NoAccess,
+            Path::new("/workspace"),
+            false,
+            None,
+        )
+        .unwrap();
+        let mut launcher = MockSeatbeltLauncher::default();
+        launcher.launch(MACOS_PATH_TO_SEATBELT_EXECUTABLE, args);
+
+        assert_eq!(launcher.executable, MACOS_PATH_TO_SEATBELT_EXECUTABLE);
+        assert_eq!(launcher.args[launcher.args.len() - 3], "--");
+        assert_eq!(launcher.args[launcher.args.len() - 2], "tool");
+        assert_eq!(launcher.args.last().unwrap(), "$(not-a-shell)");
+    }
+
+    #[derive(Default)]
+    struct MockSeatbeltLauncher {
+        executable: String,
+        args: Vec<String>,
+    }
+
+    impl MockSeatbeltLauncher {
+        fn launch(&mut self, executable: &str, args: Vec<String>) {
+            self.executable = executable.to_string();
+            self.args = args;
+        }
     }
 
     #[test]
@@ -336,5 +394,8 @@ mod tests {
         assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
         assert!(!is_loopback_host("192.168.1.1"));
         assert!(!is_loopback_host("8.8.8.8"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("::1.attacker.example"));
     }
 }

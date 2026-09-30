@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-09-30
+
+### Security Disclosure
+
+The `v0.2.1` release and earlier versions must not be treated as complete
+protected executors. Applications relying on the advertised sandbox policies
+may not have received the requested OS-level isolation.
+
+Affected areas included:
+
+- Linux execution could require an unavailable external `linux-sandbox`
+  executable, while the bundled CLI only printed a request instead of running
+  it. Landlock types described rules but did not apply Landlock syscalls.
+- Linux command construction used invalid or overly broad mount behavior, did
+  not consistently enforce network policy, and inherited environment values
+  that can alter child-process loading or startup behavior.
+- Unsupported or unavailable platform backends could return an ordinary
+  command path, creating a fail-open risk for callers that assumed a protected
+  request was executable.
+- Windows protected execution could fall back to `std::process::Command`, and
+  process-pipe, timeout, and handle-lifecycle failures were not fully
+  contained.
+- BSD enforcement was applied in the parent process rather than reliably in
+  the child, and Seatbelt policy paths were not escaped before insertion into
+  generated policy text.
+
+The security fixes on this branch add a Bubblewrap executor with capability
+probing, explicit mounts, filtered environments, and fail-closed network and
+filesystem policy handling; remove the fake Landlock execution path; reject
+unverified platform backends; harden Windows process supervision; move BSD
+restrictions into child setup; escape Seatbelt paths; and make the CLI execute
+and wait for the protected child. Boundary tests cover Linux read isolation,
+write isolation, workspace writes, and literal argument handling. Follow-up
+hardening also rejects unsupported Seatbelt Proxy networking instead of
+allowing all network access, and runs mocked Seatbelt, Windows, Capsicum, and
+pledge adapter tests on Linux CI. No CVE has been assigned to this disclosure.
+
 ## [0.2.1] - 2026-04-05
 
 ### Analysis: Unfinished Features

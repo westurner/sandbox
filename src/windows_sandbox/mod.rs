@@ -193,6 +193,70 @@ pub fn get_sandbox_level(policy: &WindowsSandboxPolicy) -> WindowsSandboxLevel {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn with_windows_process_adapter<T>(
+    policy: &WindowsSandboxPolicy,
+    execute: impl FnOnce(bool) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    execute(get_sandbox_level(policy) != WindowsSandboxLevel::Disabled)
+}
+
+#[cfg(test)]
+mod portable_adapter_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io;
+
+    struct MockWindowsProcessAdapter {
+        restricted_selected: Cell<Option<bool>>,
+    }
+
+    impl MockWindowsProcessAdapter {
+        fn execute(&self, policy: &WindowsSandboxPolicy) -> io::Result<()> {
+            with_windows_process_adapter(policy, |restricted| {
+                self.restricted_selected.set(Some(restricted));
+                if restricted {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "mock restricted process launcher unavailable",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn protected_policy_does_not_fall_back_to_unrestricted_process() {
+        let adapter = MockWindowsProcessAdapter {
+            restricted_selected: Cell::new(None),
+        };
+
+        let result = adapter.execute(&WindowsSandboxPolicy::read_only());
+
+        assert_eq!(adapter.restricted_selected.get(), Some(true));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn full_access_policy_selects_only_the_unrestricted_process() {
+        let adapter = MockWindowsProcessAdapter {
+            restricted_selected: Cell::new(None),
+        };
+        let policy = WindowsSandboxPolicy {
+            read_allow: Vec::new(),
+            write_deny: Vec::new(),
+            network_allowed: true,
+            use_private_desktop: false,
+        };
+
+        adapter.execute(&policy).unwrap();
+
+        assert_eq!(adapter.restricted_selected.get(), Some(false));
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
@@ -382,106 +446,105 @@ mod windows_impl {
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
-        // Get sandbox level from policy
-        let sandbox_level = get_sandbox_level(policy);
-
-        // If policy indicates we need sandboxing, use only the restricted-token
-        // process creator. A failure is returned; never run the original command.
-        if sandbox_level != WindowsSandboxLevel::Disabled {
-            let handles = unsafe { spawn_restricted_process(program, args, cwd, env, policy) }?;
-            if handles.stderr_read.is_none() {
-                unsafe { close_spawn_handles(&handles) };
-                return Err(io::Error::other(
-                    "restricted process returned no stderr pipe",
-                ));
+        with_windows_process_adapter(policy, |restricted| {
+            // A protected policy uses only the restricted-token process creator.
+            // Failure is returned; the original command is never run.
+            if restricted {
+                let handles = unsafe { spawn_restricted_process(program, args, cwd, env, policy) }?;
+                if handles.stderr_read.is_none() {
+                    unsafe { close_spawn_handles(&handles) };
+                    return Err(io::Error::other(
+                        "restricted process returned no stderr pipe",
+                    ));
+                }
+                let process = handles.process;
+                let stdout_handle = handles.stdout_read;
+                let stderr_handle = handles.stderr_read.expect("checked above");
+                let stdout_handle = stdout_handle as usize;
+                let stderr_handle = stderr_handle as usize;
+                let stdout_thread = std::thread::spawn(move || read_pipe(stdout_handle));
+                let stderr_thread = std::thread::spawn(move || read_pipe(stderr_handle));
+                return unsafe {
+                    wait_for_restricted_process(process, timeout_ms, stdout_thread, stderr_thread)
+                };
             }
-            let process = handles.process;
-            let stdout_handle = handles.stdout_read;
-            let stderr_handle = handles.stderr_read.expect("checked above");
-            let stdout_handle = stdout_handle as usize;
-            let stderr_handle = stderr_handle as usize;
-            let stdout_thread = std::thread::spawn(move || read_pipe(stdout_handle));
-            let stderr_thread = std::thread::spawn(move || read_pipe(stderr_handle));
-            return unsafe {
-                wait_for_restricted_process(process, timeout_ms, stdout_thread, stderr_thread)
-            };
-        }
 
-        // Fallback to standard Command for disabled sandbox
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        cmd.current_dir(cwd);
+            // Fallback to standard Command for disabled sandbox
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            cmd.current_dir(cwd);
 
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
 
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn()?;
+            let mut child = cmd.spawn()?;
 
-        let timeout = timeout_ms.map(Duration::from_millis);
+            let timeout = timeout_ms.map(Duration::from_millis);
 
-        if let Some(timeout) = timeout {
-            // Simple timeout implementation using std::thread::sleep
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait()? {
-                    Some(status) => {
-                        let exit_code = status.code().unwrap_or(-1);
-                        let stdout = child
-                            .stdout
-                            .take()
-                            .map(|mut s| {
-                                let mut v = vec![];
-                                std::io::Read::read_to_end(&mut s, &mut v).ok();
-                                v
-                            })
-                            .unwrap_or_default();
-                        let stderr = child
-                            .stderr
-                            .take()
-                            .map(|mut s| {
-                                let mut v = vec![];
-                                std::io::Read::read_to_end(&mut s, &mut v).ok();
-                                v
-                            })
-                            .unwrap_or_default();
+            if let Some(timeout) = timeout {
+                // Simple timeout implementation using std::thread::sleep
+                let start = std::time::Instant::now();
+                loop {
+                    match child.try_wait()? {
+                        Some(status) => {
+                            let exit_code = status.code().unwrap_or(-1);
+                            let stdout = child
+                                .stdout
+                                .take()
+                                .map(|mut s| {
+                                    let mut v = vec![];
+                                    std::io::Read::read_to_end(&mut s, &mut v).ok();
+                                    v
+                                })
+                                .unwrap_or_default();
+                            let stderr = child
+                                .stderr
+                                .take()
+                                .map(|mut s| {
+                                    let mut v = vec![];
+                                    std::io::Read::read_to_end(&mut s, &mut v).ok();
+                                    v
+                                })
+                                .unwrap_or_default();
 
-                        return Ok(SandboxExecutionResult {
-                            exit_code,
-                            stdout,
-                            stderr,
-                            timed_out: false,
-                        });
-                    }
-                    None => {
-                        if start.elapsed() > timeout {
-                            // Timeout - kill the process
-                            let _ = child.kill();
-                            let _ = child.wait();
                             return Ok(SandboxExecutionResult {
-                                exit_code: -1,
-                                stdout: vec![],
-                                stderr: vec![],
-                                timed_out: true,
+                                exit_code,
+                                stdout,
+                                stderr,
+                                timed_out: false,
                             });
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None => {
+                            if start.elapsed() > timeout {
+                                // Timeout - kill the process
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return Ok(SandboxExecutionResult {
+                                    exit_code: -1,
+                                    stdout: vec![],
+                                    stderr: vec![],
+                                    timed_out: true,
+                                });
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
                 }
             }
-        }
 
-        let output = child.wait_with_output()?;
+            let output = child.wait_with_output()?;
 
-        Ok(SandboxExecutionResult {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-            timed_out: false,
+            Ok(SandboxExecutionResult {
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: false,
+            })
         })
     }
 
@@ -604,8 +667,6 @@ use self::process::{spawn_process_with_pipes, StderrMode, StdinMode};
 use self::token::{close_token, create_readonly_token};
 
 #[cfg(test)]
-#[cfg(test)]
-#[cfg(target_os = "windows")]
 mod tests {
     use super::*;
 

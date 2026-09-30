@@ -15,6 +15,8 @@ pub enum BwrapBuildError {
     MissingMountPath(PathBuf),
     #[error("sandbox path is not valid UTF-8: {0}")]
     InvalidMountPath(PathBuf),
+    #[error("filesystem root cannot be mounted writable: {0}")]
+    WritableFilesystemRoot(PathBuf),
     #[error("filesystem policy cannot be enforced by Bubblewrap: {0}")]
     UnsupportedFilesystemPolicy(&'static str),
 }
@@ -282,6 +284,9 @@ pub fn create_workspace_bwrap_command(
 
     for root in writable_roots {
         let root = mount_path(root)?;
+        if Path::new(&root) == Path::new("/") {
+            return Err(BwrapBuildError::WritableFilesystemRoot(PathBuf::from(root)));
+        }
         args = args.rw_bind(Path::new(&root), Path::new(&root));
     }
 
@@ -396,6 +401,37 @@ mod tests {
             Err(BwrapBuildError::UnsupportedNetworkPolicy(
                 crate::NetworkSandboxPolicy::Localhost
             ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_workspace_write_rejects_symlink_to_filesystem_root() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ai-sandbox-root-link-{suffix}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let root_link = base.join("workspace");
+        symlink("/", &root_link).unwrap();
+
+        let result = create_workspace_bwrap_command(
+            vec!["true".to_string()],
+            Path::new("/tmp"),
+            &[root_link.clone()],
+            &[],
+            crate::NetworkSandboxPolicy::NoAccess,
+        );
+
+        std::fs::remove_file(root_link).unwrap();
+        std::fs::remove_dir(base).unwrap();
+        assert!(matches!(
+            result,
+            Err(BwrapBuildError::WritableFilesystemRoot(_))
         ));
     }
 }

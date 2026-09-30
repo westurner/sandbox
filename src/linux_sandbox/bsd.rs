@@ -26,6 +26,37 @@ extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+#[cfg(target_os = "openbsd")]
+extern "C" {
+    fn pledge(
+        promises: *const std::ffi::CStr,
+        execpromises: *const std::ffi::CStr,
+    ) -> std::os::raw::c_int;
+}
+
+trait CapsicumApi {
+    fn enter(&self) -> std::io::Result<()>;
+}
+
+fn enforce_capsicum(api: &impl CapsicumApi) -> std::io::Result<()> {
+    api.enter()
+}
+
+#[cfg(target_os = "freebsd")]
+struct NativeCapsicumApi;
+
+#[cfg(target_os = "freebsd")]
+impl CapsicumApi for NativeCapsicumApi {
+    fn enter(&self) -> std::io::Result<()> {
+        let result = unsafe { cap_enter() };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
 /// OpenBSD pledge promises
 #[derive(Clone, Debug, Default)]
 pub struct PledgePromises {
@@ -45,6 +76,42 @@ pub struct PledgePromises {
     pub flock: bool,
     pub tmppath: bool,
     pub error: bool,
+}
+
+trait PledgeApi {
+    fn pledge(
+        &self,
+        promises: &std::ffi::CStr,
+        execpromises: &std::ffi::CStr,
+    ) -> std::io::Result<()>;
+}
+
+fn enforce_pledge(api: &impl PledgeApi, promises: &PledgePromises) -> std::io::Result<()> {
+    let promise_string = promises.to_pledge_string();
+    let promise_cstr = std::ffi::CString::new(promise_string).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pledge promises")
+    })?;
+    let empty_cstr = std::ffi::CString::new("").expect("empty CString is valid");
+    api.pledge(promise_cstr.as_c_str(), empty_cstr.as_c_str())
+}
+
+#[cfg(target_os = "openbsd")]
+struct NativePledgeApi;
+
+#[cfg(target_os = "openbsd")]
+impl PledgeApi for NativePledgeApi {
+    fn pledge(
+        &self,
+        promises: &std::ffi::CStr,
+        execpromises: &std::ffi::CStr,
+    ) -> std::io::Result<()> {
+        let result = unsafe { pledge(promises, execpromises) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
 }
 
 impl PledgePromises {
@@ -257,14 +324,9 @@ mod freebsd_impl {
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
 
-        cmd.pre_exec(|| {
-            let result = unsafe { super::cap_enter() };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
+        unsafe {
+            cmd.pre_exec(|| super::enforce_capsicum(&super::NativeCapsicumApi));
+        }
 
         cmd.spawn()
     }
@@ -275,25 +337,13 @@ mod openbsd_impl {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    // Import the pledge libc function
-    extern "C" {
-        fn pledge(
-            promises: *const std::ffi::CStr,
-            execpromises: *const std::ffi::CStr,
-        ) -> std::os::raw::c_int;
-    }
-
     /// Execute a command with pledge sandbox
     pub fn execute_with_pledge(
         program: &str,
         args: &[String],
         promises: &super::PledgePromises,
     ) -> std::io::Result<std::process::Child> {
-        let promise_str = promises.to_pledge_string();
-        let promise_cstr = std::ffi::CString::new(promise_str).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pledge promises")
-        })?;
-        let empty_cstr = std::ffi::CString::new("").expect("empty CString is valid");
+        let promises = promises.clone();
 
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -301,13 +351,7 @@ mod openbsd_impl {
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
 
-        cmd.pre_exec(move || unsafe {
-            if pledge(promise_cstr.as_c_str(), empty_cstr.as_c_str()) != 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+        cmd.pre_exec(move || super::enforce_pledge(&super::NativePledgeApi, &promises));
 
         cmd.spawn()
     }
@@ -351,6 +395,53 @@ pub use openbsd_impl::execute_with_pledge;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+
+    struct MockCapsicumApi {
+        calls: Cell<usize>,
+        fail: bool,
+    }
+
+    impl CapsicumApi for MockCapsicumApi {
+        fn enter(&self) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "mock cap_enter failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockPledgeApi {
+        promises: RefCell<Option<String>>,
+        execpromises: RefCell<Option<String>>,
+        fail: bool,
+    }
+
+    impl PledgeApi for MockPledgeApi {
+        fn pledge(
+            &self,
+            promises: &std::ffi::CStr,
+            execpromises: &std::ffi::CStr,
+        ) -> io::Result<()> {
+            *self.promises.borrow_mut() = Some(promises.to_string_lossy().into_owned());
+            *self.execpromises.borrow_mut() = Some(execpromises.to_string_lossy().into_owned());
+            if self.fail {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "mock pledge failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     #[test]
     fn test_pledge_promises() {
@@ -453,5 +544,36 @@ mod tests {
         assert!(s.contains("rpath"));
         assert!(!s.contains("wpath")); // Not allowed by default
         assert!(!s.contains("inet")); // Not allowed by default
+    }
+
+    #[test]
+    fn mock_capsicum_adapter_calls_and_propagates_failure() {
+        let api = MockCapsicumApi {
+            calls: Cell::new(0),
+            fail: true,
+        };
+
+        let error = enforce_capsicum(&api).unwrap_err();
+
+        assert_eq!(api.calls.get(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn mock_pledge_adapter_receives_policy_and_propagates_failure() {
+        let api = MockPledgeApi {
+            promises: RefCell::new(None),
+            execpromises: RefCell::new(None),
+            fail: true,
+        };
+
+        let error = enforce_pledge(&api, &PledgePromises::default_safe()).unwrap_err();
+
+        assert_eq!(
+            api.promises.borrow().as_deref(),
+            Some("stdio rpath tmppath error")
+        );
+        assert_eq!(api.execpromises.borrow().as_deref(), Some(""));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
