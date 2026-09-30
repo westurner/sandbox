@@ -233,16 +233,18 @@ pub fn create_pledge_promises_from_policy(
             promises.dns = true;
         }
         crate::NetworkSandboxPolicy::Localhost => {
-            // Localhost still needs inet for loopback
-            promises.inet = true;
+            // pledge cannot restrict inet to loopback destinations.
+            promises.inet = false;
+            promises.dns = false;
         }
         crate::NetworkSandboxPolicy::NoAccess => {
             promises.inet = false;
             promises.dns = false;
         }
         crate::NetworkSandboxPolicy::Proxy => {
-            promises.inet = true;
-            promises.dns = true;
+            // pledge cannot restrict inet to a configured proxy endpoint.
+            promises.inet = false;
+            promises.dns = false;
         }
     }
 
@@ -498,9 +500,8 @@ mod tests {
         // WorkspaceWrite should allow read and write
         assert!(s.contains("rpath"));
         assert!(s.contains("wpath"));
-        // Localhost should allow inet for loopback
-        assert!(s.contains("inet"));
-        // But not dns (specific to localhost)
+        // pledge cannot limit inet to loopback, so fail closed.
+        assert!(!s.split_whitespace().any(|promise| promise == "inet"));
         assert!(!s.contains("dns"));
     }
 
@@ -511,9 +512,9 @@ mod tests {
             crate::NetworkSandboxPolicy::Proxy,
         );
         let s = promises.to_pledge_string();
-        // External has minimal restrictions, Proxy allows inet and dns
-        assert!(s.contains("inet"));
-        assert!(s.contains("dns"));
+        // pledge cannot restrict access to the configured proxy endpoint.
+        assert!(!s.split_whitespace().any(|promise| promise == "inet"));
+        assert!(!s.contains("dns"));
     }
 
     #[test]

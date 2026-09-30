@@ -11,8 +11,8 @@ pub mod bwrap;
 pub use bwrap::BwrapBuildError;
 
 pub use bsd::{
-    create_pledge_promises_from_policy, execute_with_capsicum, execute_with_pledge,
-    is_capsicum_available, is_pledge_available, CapsicumLevel, PledgePromises,
+    create_freebsd_sandbox_args, create_pledge_promises_from_policy, execute_with_capsicum,
+    execute_with_pledge, is_capsicum_available, is_pledge_available, CapsicumLevel, PledgePromises,
 };
 
 pub use landlock::{

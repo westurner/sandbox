@@ -211,7 +211,7 @@ pub fn get_sandbox_level(policy: &WindowsSandboxPolicy) -> WindowsSandboxLevel {
         }
     }
 
-    if policy.write_deny.is_empty() && policy.network_allowed {
+    if policy.read_allow.is_empty() && policy.write_deny.is_empty() && policy.network_allowed {
         WindowsSandboxLevel::Disabled
     } else if policy.network_allowed {
         WindowsSandboxLevel::Basic
@@ -281,6 +281,24 @@ mod portable_adapter_tests {
         adapter.execute(&policy).unwrap();
 
         assert_eq!(adapter.restricted_selected.get(), Some(false));
+    }
+
+    #[test]
+    fn read_allow_policy_never_selects_the_unrestricted_process() {
+        let adapter = MockWindowsProcessAdapter {
+            restricted_selected: Cell::new(None),
+        };
+        let policy = WindowsSandboxPolicy {
+            read_allow: vec![PathBuf::from("/workspace")],
+            write_deny: Vec::new(),
+            network_allowed: true,
+            use_private_desktop: false,
+        };
+
+        let result = adapter.execute(&policy);
+
+        assert_eq!(adapter.restricted_selected.get(), Some(true));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 }
 

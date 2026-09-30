@@ -76,6 +76,9 @@ cargo build --release
 cargo run --example demo
 ```
 
+See [Formal Models and Fuzzing](FORMAL_AND_FUZZING.md) for adapter lifecycle
+models, TLC commands and results, cargo-fuzz targets, and findings.
+
 ## Core API
 
 ### SandboxManager

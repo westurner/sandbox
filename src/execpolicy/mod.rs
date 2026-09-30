@@ -477,6 +477,14 @@ impl Policy {
         const MAX_PROGRAM_LENGTH: usize = 16; // Max length for program name (keep short for matching)
         const MAX_ARG_LENGTH: usize = 1024; // Maximum length for arguments
 
+        fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+            let mut end = value.len().min(max_bytes);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            &value[..end]
+        }
+
         command
             .iter()
             .enumerate()
@@ -491,13 +499,13 @@ impl Policy {
                     // Limit to MAX_PROGRAM_LENGTH chars for security
                     // This ensures long commands like "lsxxxx..." get matched against "ls" rules
                     if s.len() > MAX_PROGRAM_LENGTH {
-                        s[..MAX_PROGRAM_LENGTH].to_string()
+                        truncate_utf8(&s, MAX_PROGRAM_LENGTH).to_string()
                     } else {
                         s
                     }
                 } else if s.len() > MAX_ARG_LENGTH {
                     // Truncate excessively long arguments
-                    s[..MAX_ARG_LENGTH].to_string()
+                    truncate_utf8(&s, MAX_ARG_LENGTH).to_string()
                 } else {
                     s
                 }
@@ -1211,6 +1219,21 @@ mod tests {
         let result = policy.check(&["ls".to_string(), "-la".to_string()]);
         assert!(result.is_some());
         assert_eq!(result.unwrap().decision, Decision::Allow);
+    }
+
+    #[test]
+    fn sanitization_truncates_multibyte_strings_at_character_boundaries() {
+        let replacement = char::REPLACEMENT_CHARACTER.to_string();
+        let _ = Policy::new().check(&[replacement.repeat(6)]);
+        let sanitized = Policy::sanitize_command(&[
+            replacement.repeat(20),
+            format!("{}{}tail", "a".repeat(1023), replacement),
+        ]);
+        assert_eq!(sanitized[0], replacement.repeat(5));
+        assert_eq!(sanitized[1], "a".repeat(1023));
+        assert!(sanitized
+            .iter()
+            .all(|value| value.is_char_boundary(value.len())));
     }
 
     #[test]
