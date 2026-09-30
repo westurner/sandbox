@@ -68,16 +68,6 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Quote a Windows command line argument
-fn quote_windows_arg(arg: &str) -> String {
-    if arg.is_empty() || arg.contains(' ') || arg.contains('"') || arg.contains('\'') {
-        let escaped = arg.replace('"', "\\\"");
-        format!("\"{}\"", escaped)
-    } else {
-        arg.to_string()
-    }
-}
-
 /// Make an environment block from a HashMap
 pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
     let mut items: Vec<(String, String)> =
@@ -133,9 +123,13 @@ pub unsafe fn create_process_as_user(
     stdio: Option<(HANDLE, HANDLE, HANDLE)>,
     _use_private_desktop: bool,
 ) -> Result<PROCESS_INFORMATION, String> {
+    let Some(program) = argv.first() else {
+        return Err("command argv must contain an executable".to_string());
+    };
+    let application_name = to_wide(program);
     let cmdline_str = argv
         .iter()
-        .map(|a| quote_windows_arg(a))
+        .map(|a| super::quote_windows_arg(a))
         .collect::<Vec<_>>()
         .join(" ");
     let cmdline: Vec<u16> = to_wide(&cmdline_str);
@@ -171,7 +165,7 @@ pub unsafe fn create_process_as_user(
     #[allow(clippy::unnecessary_mut_passed)]
     let result = CreateProcessAsUserW(
         h_token,
-        ptr::null(), // Application name (use command line)
+        application_name.as_ptr(),
         cmdline.as_ptr() as *mut u16,
         ptr::null(), // Process security attributes
         ptr::null(), // Thread security attributes
@@ -353,12 +347,5 @@ mod tests {
         assert!(!block.is_empty());
         // Should end with double null
         assert_eq!(block[block.len() - 1], 0);
-    }
-
-    #[test]
-    fn test_quote_windows_arg() {
-        assert_eq!(quote_windows_arg("simple"), "simple");
-        assert_eq!(quote_windows_arg("with space"), "\"with space\"");
-        assert_eq!(quote_windows_arg("with\"quote"), "\"with\\\"quote\"");
     }
 }

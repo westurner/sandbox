@@ -37,7 +37,10 @@ and wait for the protected child. Boundary tests cover Linux read isolation,
 write isolation, workspace writes, and literal argument handling. Follow-up
 hardening also rejects unsupported Seatbelt Proxy networking instead of
 allowing all network access, and runs mocked Seatbelt, Windows, Capsicum, and
-pledge adapter tests on Linux CI. No CVE has been assigned to this disclosure.
+pledge adapter tests on Linux CI. Additional review rejects writable filesystem
+modes hidden inside a `ReadOnly` policy and fixes Windows command-line quoting
+for quotes and backslashes while passing the executable path separately to
+`CreateProcessAsUserW`. No CVE has been assigned to this disclosure.
 
 ## [0.2.1] - 2026-04-05
 

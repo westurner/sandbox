@@ -184,9 +184,10 @@ impl SandboxPolicy {
         match self {
             // DangerFullAccess is not secure
             SandboxPolicy::DangerFullAccess => false,
-            // ReadOnly is secure by default
+            // The ReadOnly variant must not smuggle in a more permissive
+            // filesystem policy that selects a writable backend.
             SandboxPolicy::ReadOnly { file_system, .. } => {
-                !matches!(file_system, FileSystemSandboxPolicy::External)
+                matches!(file_system, FileSystemSandboxPolicy::ReadOnly)
             }
             // ExternalSandbox is not controlled by us, treat as potentially insecure
             SandboxPolicy::ExternalSandbox { .. } => false,
@@ -443,8 +444,7 @@ impl SandboxManager {
         // SECURITY: Validate policy before creating execution request
         if !policy.is_safe() {
             return Err(SandboxTransformError::UnsafePolicy(
-                "Policy failed safety check: empty writable_roots or path traversal detected"
-                    .to_string(),
+                "policy failed safety validation".to_string(),
             ));
         }
 
@@ -731,6 +731,53 @@ mod tests {
             !matches!(default_policy, SandboxPolicy::DangerFullAccess),
             "默认策略不应该是 DangerFullAccess，这是安全漏洞！"
         );
+    }
+
+    #[test]
+    fn readonly_policy_rejects_permissive_filesystem_modes() {
+        for file_system in [
+            FileSystemSandboxPolicy::FullAccess,
+            FileSystemSandboxPolicy::External,
+            FileSystemSandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![PathBuf::from("/tmp")],
+            },
+        ] {
+            let policy = SandboxPolicy::ReadOnly {
+                file_system,
+                network_access: NetworkSandboxPolicy::NoAccess,
+            };
+            assert!(!policy.is_safe());
+        }
+
+        let read_only = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        assert!(read_only.is_safe());
+    }
+
+    #[test]
+    fn execution_entrypoints_reject_full_access_inside_readonly_policy() {
+        let policy = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::FullAccess,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        let command = || SandboxCommand {
+            program: OsString::from("tool"),
+            args: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            env: HashMap::new(),
+        };
+        let manager = SandboxManager::new();
+
+        assert!(matches!(
+            manager.create_exec_request(command(), policy.clone()),
+            Err(SandboxTransformError::UnsafePolicy(_))
+        ));
+        assert!(matches!(
+            manager.transform_command(command(), policy, SandboxType::LinuxSeccomp, None),
+            Err(SandboxTransformError::UnsafePolicy(_))
+        ));
     }
 
     #[test]

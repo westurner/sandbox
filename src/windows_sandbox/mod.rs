@@ -22,6 +22,33 @@ mod process;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "windows", test))]
+fn quote_windows_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+
+    for character in arg.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 /// Windows sandbox level
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WindowsSandboxLevel {
@@ -669,6 +696,18 @@ use self::token::{close_token, create_readonly_token};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_argument_quoting_preserves_backslashes_and_quotes() {
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("simple"), "\"simple\"");
+        assert_eq!(quote_windows_arg("with space"), "\"with space\"");
+        assert_eq!(quote_windows_arg("with\\\"quote"), "\"with\\\\\\\"quote\"");
+        assert_eq!(
+            quote_windows_arg("trailing space\\"),
+            "\"trailing space\\\\\""
+        );
+    }
 
     #[test]
     fn test_windows_sandbox_level_default() {
