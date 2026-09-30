@@ -50,8 +50,12 @@ pub fn system_bwrap_warning() -> Option<String> {
 
 /// Verify that Bubblewrap can create the namespaces required by the executor.
 pub fn ensure_bwrap_support() -> Result<(), String> {
-    let executable = find_system_bwrap_in_path()
-        .ok_or_else(|| "bubblewrap executable was not found in PATH".to_string())?;
+    ensure_bwrap_support_with(find_system_bwrap_in_path)
+}
+
+fn ensure_bwrap_support_with(find: impl FnOnce() -> Option<PathBuf>) -> Result<(), String> {
+    let executable =
+        find().ok_or_else(|| "bubblewrap executable was not found in PATH".to_string())?;
     let status = Command::new(&executable)
         .args([
             "--unshare-user",
@@ -76,6 +80,51 @@ pub fn ensure_bwrap_support() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("bubblewrap capability probe exited with {status}"))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bwrap_support_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn executable_script(body: &str) -> (PathBuf, PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-sandbox-bwrap-probe-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("bwrap");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        (path, directory)
+    }
+
+    #[test]
+    fn bwrap_support_probe_covers_missing_spawn_and_exit_statuses() {
+        assert!(ensure_bwrap_support_with(|| None)
+            .unwrap_err()
+            .contains("not found in PATH"));
+
+        let missing = std::env::temp_dir().join("ai-sandbox-no-such-bwrap-executable");
+        assert!(ensure_bwrap_support_with(|| Some(missing))
+            .unwrap_err()
+            .contains("failed to probe bubblewrap"));
+
+        let (success, success_dir) = executable_script("exit 0");
+        assert!(ensure_bwrap_support_with(|| Some(success)).is_ok());
+
+        let (failure, failure_dir) = executable_script("exit 7");
+        assert!(ensure_bwrap_support_with(|| Some(failure))
+            .unwrap_err()
+            .contains("exited with exit status: 7"));
+
+        std::fs::remove_dir_all(success_dir).unwrap();
+        std::fs::remove_dir_all(failure_dir).unwrap();
     }
 }
 

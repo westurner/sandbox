@@ -184,8 +184,8 @@ impl SandboxPolicy {
         match self {
             // DangerFullAccess is not secure
             SandboxPolicy::DangerFullAccess => false,
-            // The ReadOnly variant must not smuggle in a more permissive
-            // filesystem policy that selects a writable backend.
+            // The ReadOnly variant must not introduce a more permissive
+            // filesystem policy that then selects a writable backend.
             SandboxPolicy::ReadOnly { file_system, .. } => {
                 matches!(file_system, FileSystemSandboxPolicy::ReadOnly)
             }
@@ -282,7 +282,15 @@ impl SandboxExecRequest {
 
     /// Run the transformed command and terminate it when the timeout expires.
     pub fn run(&self, timeout: Duration) -> Result<ExitStatus, SandboxExecutionError> {
-        let mut child = self.spawn()?;
+        self.run_with_spawn(timeout, |request| request.spawn())
+    }
+
+    fn run_with_spawn(
+        &self,
+        timeout: Duration,
+        spawn: impl FnOnce(&Self) -> Result<Child, SandboxExecutionError>,
+    ) -> Result<ExitStatus, SandboxExecutionError> {
+        let mut child = spawn(self)?;
         let started = Instant::now();
 
         loop {
@@ -300,7 +308,14 @@ impl SandboxExecRequest {
 
     /// Spawn the transformed command and wait without a timeout.
     pub fn wait(&self) -> Result<ExitStatus, SandboxExecutionError> {
-        let mut child = self.spawn()?;
+        self.wait_with_spawn(|request| request.spawn())
+    }
+
+    fn wait_with_spawn(
+        &self,
+        spawn: impl FnOnce(&Self) -> Result<Child, SandboxExecutionError>,
+    ) -> Result<ExitStatus, SandboxExecutionError> {
+        let mut child = spawn(self)?;
         child.wait().map_err(SandboxExecutionError::Io)
     }
 
@@ -678,6 +693,137 @@ mod tests {
         assert_eq!(request.execution.sandbox, SandboxType::LinuxSeccomp);
     }
 
+    fn request_for_process_tests(program: &str, sandbox: SandboxType) -> SandboxExecRequest {
+        SandboxExecRequest {
+            command: vec![program.to_string()],
+            cwd: std::env::current_dir().unwrap(),
+            env: HashMap::new(),
+            sandbox,
+            sandbox_policy: SandboxPolicy::default(),
+            file_system_policy: FileSystemSandboxPolicy::ReadOnly,
+            network_policy: NetworkSandboxPolicy::NoAccess,
+            arg0: None,
+            execution: PreparedExecution {
+                command: vec![program.to_string()],
+                cwd: std::env::current_dir().unwrap(),
+                env: HashMap::new(),
+                sandbox,
+            },
+        }
+    }
+
+    #[test]
+    fn request_spawn_rejects_empty_and_unavailable_backends() {
+        let mut empty = request_for_process_tests("true", SandboxType::None);
+        empty.execution.command.clear();
+        assert!(matches!(
+            empty.spawn(),
+            Err(SandboxExecutionError::InvalidCommand(_))
+        ));
+
+        let unprotected = request_for_process_tests("true", SandboxType::None);
+        assert!(matches!(
+            unprotected.spawn(),
+            Err(SandboxExecutionError::Unsupported(_))
+        ));
+
+        let unsupported = request_for_process_tests("true", SandboxType::FreeBSDCapsicum);
+        assert!(matches!(
+            unsupported.spawn(),
+            Err(SandboxExecutionError::Unsupported(_))
+        ));
+
+        let mut empty_wait = request_for_process_tests("true", SandboxType::None);
+        empty_wait.execution.command.clear();
+        assert!(matches!(
+            empty_wait.run(Duration::ZERO),
+            Err(SandboxExecutionError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            empty_wait.wait(),
+            Err(SandboxExecutionError::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn request_wait_returns_status_and_propagates_spawn_errors() {
+        let request = request_for_process_tests("true", SandboxType::None);
+        let status = request
+            .wait_with_spawn(|_| {
+                Command::new("true")
+                    .spawn()
+                    .map_err(SandboxExecutionError::Io)
+            })
+            .unwrap();
+        assert!(status.success());
+
+        let error = request.wait_with_spawn(|_| {
+            Err(SandboxExecutionError::Unsupported(
+                "mock spawn failure".into(),
+            ))
+        });
+        assert!(matches!(error, Err(SandboxExecutionError::Unsupported(_))));
+    }
+
+    #[test]
+    fn request_run_returns_early_status_and_enforces_timeout() {
+        let request = request_for_process_tests("true", SandboxType::None);
+        let status = request
+            .run_with_spawn(Duration::from_secs(1), |_| {
+                Command::new("true")
+                    .spawn()
+                    .map_err(SandboxExecutionError::Io)
+            })
+            .unwrap();
+        assert!(status.success());
+
+        let timeout = Duration::from_millis(20);
+        let result = request.run_with_spawn(timeout, |_| {
+            Command::new("sleep")
+                .arg("1")
+                .spawn()
+                .map_err(SandboxExecutionError::Io)
+        });
+        assert!(matches!(result, Err(SandboxExecutionError::TimedOut(value)) if value == timeout));
+    }
+
+    #[test]
+    fn unsafe_environment_keys_cover_prefix_and_exact_matches() {
+        for key in [
+            "LD_PRELOAD",
+            "DYLD_LIBRARY_PATH",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "PERL5OPT",
+            "PYTHONINSPECT",
+            "RUBYOPT",
+        ] {
+            assert!(is_unsafe_environment_key(key), "{key} should be filtered");
+        }
+        for key in ["PATH", "HOME", "LD", "DYLD", "NODE_PATH", "PYTHONPATH"] {
+            assert!(!is_unsafe_environment_key(key), "{key} should be retained");
+        }
+
+        let request = SandboxExecRequest {
+            execution: PreparedExecution {
+                command: vec!["true".into()],
+                cwd: std::env::current_dir().unwrap(),
+                env: [
+                    ("PATH".into(), "/usr/bin".into()),
+                    ("LD_PRELOAD".into(), "inject.so".into()),
+                ]
+                .into(),
+                sandbox: SandboxType::None,
+            },
+            ..request_for_process_tests("/bin/sh", SandboxType::None)
+        };
+        let mut command = request.command_for_spawn();
+        command.arg("-c");
+        command.arg("test \"$PATH\" = /usr/bin && test -z \"${LD_PRELOAD:-}\"");
+        assert!(command.status().unwrap().success());
+    }
+
     #[test]
     fn test_get_platform_sandbox() {
         // On Windows, sandbox requires windows_sandbox_enabled = true
@@ -754,6 +900,45 @@ mod tests {
             network_access: NetworkSandboxPolicy::NoAccess,
         };
         assert!(read_only.is_safe());
+    }
+
+    #[test]
+    fn policy_traversal_and_safety_predicates_cover_all_path_shapes() {
+        for path in ["/workspace/../outside", "/workspace/.hidden", "./relative"] {
+            assert!(SandboxPolicy::contains_path_traversal(Path::new(path)));
+        }
+        assert!(!SandboxPolicy::contains_path_traversal(Path::new(
+            "/workspace/project"
+        )));
+
+        assert!(!SandboxPolicy::DangerFullAccess.is_safe());
+        assert!(!SandboxPolicy::ExternalSandbox {
+            network_access: NetworkSandboxPolicy::NoAccess,
+        }
+        .is_safe());
+        assert!(!SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            network_access: NetworkSandboxPolicy::NoAccess,
+        }
+        .is_safe());
+
+        for root in [PathBuf::from("relative"), PathBuf::from("/")] {
+            assert!(!SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![root],
+                network_access: NetworkSandboxPolicy::NoAccess,
+            }
+            .is_safe());
+        }
+        assert!(!SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![PathBuf::from("/workspace/../outside")],
+            network_access: NetworkSandboxPolicy::NoAccess,
+        }
+        .is_safe());
+        assert!(SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![PathBuf::from("/workspace/project")],
+            network_access: NetworkSandboxPolicy::NoAccess,
+        }
+        .is_safe());
     }
 
     #[test]
@@ -972,7 +1157,6 @@ mod tests {
 
     #[test]
     fn test_sandbox_command_validation() {
-        // 测试 SandboxCommand 验证
         let command = SandboxCommand {
             program: OsString::from("ls"),
             args: vec!["-la".to_string(), "/tmp".to_string()],
@@ -980,9 +1164,9 @@ mod tests {
             env: HashMap::new(),
         };
 
-        assert!(!command.program.is_empty());
-        assert!(!command.args.is_empty());
-        assert!(command.cwd.exists() || command.cwd.to_string_lossy() == "/tmp");
+        assert_eq!(command.program, OsString::from("ls"));
+        assert_eq!(command.args, vec!["-la", "/tmp"]);
+        assert_eq!(command.cwd, PathBuf::from("/tmp"));
     }
 
     #[test]
@@ -1008,7 +1192,6 @@ mod tests {
 
     #[test]
     fn test_empty_program_name() {
-        // 测试空程序名
         let manager = SandboxManager::new();
         let command = SandboxCommand {
             program: OsString::from(""),
@@ -1017,15 +1200,12 @@ mod tests {
             env: HashMap::new(),
         };
 
-        // 应该能创建请求，但不保证能执行
         let result = manager.create_exec_request(command, SandboxPolicy::default());
-        // 空程序名可能导致错误
-        assert!(result.is_ok() || result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_very_long_program_name() {
-        // 测试超长程序名
         let manager = SandboxManager::new();
         let long_name = "A".repeat(10000);
         let command = SandboxCommand {
@@ -1036,13 +1216,11 @@ mod tests {
         };
 
         let result = manager.create_exec_request(command, SandboxPolicy::default());
-        // 长程序名应该被处理（可能返回错误但不崩溃）
-        assert!(result.is_ok() || result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_special_characters_in_args() {
-        // 测试参数中的特殊字符
         let manager = SandboxManager::new();
         let command = SandboxCommand {
             program: OsString::from("ls"),
@@ -1059,13 +1237,11 @@ mod tests {
         };
 
         let result = manager.create_exec_request(command, SandboxPolicy::default());
-        // 特殊字符应该被处理（可能返回错误但不崩溃）
-        assert!(result.is_ok() || result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_empty_cwd() {
-        // 测试空工作目录
         let manager = SandboxManager::new();
         let command = SandboxCommand {
             program: OsString::from("ls"),
@@ -1075,13 +1251,14 @@ mod tests {
         };
 
         let result = manager.create_exec_request(command, SandboxPolicy::default());
-        // 空 cwd 可能导致错误或使用默认目录
-        assert!(result.is_ok() || result.is_err());
+        assert!(matches!(
+            result,
+            Err(SandboxTransformError::BubblewrapBuild(_))
+        ));
     }
 
     #[test]
     fn test_nonexistent_cwd() {
-        // 测试不存在的工作目录
         let manager = SandboxManager::new();
         let command = SandboxCommand {
             program: OsString::from("ls"),
@@ -1091,8 +1268,10 @@ mod tests {
         };
 
         let result = manager.create_exec_request(command, SandboxPolicy::default());
-        // 应该能创建请求（可能在执行时验证目录，不一定要在创建时）
-        assert!(result.is_ok() || result.is_err());
+        assert!(matches!(
+            result,
+            Err(SandboxTransformError::BubblewrapBuild(_))
+        ));
     }
 
     // ============================================================================

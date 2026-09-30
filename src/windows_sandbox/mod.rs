@@ -714,6 +714,7 @@ use self::token::{close_token, create_readonly_token};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn windows_argument_quoting_preserves_backslashes_and_quotes() {
@@ -858,6 +859,35 @@ mod tests {
         let (allow, _deny) = compute_allow_deny_paths(&policy, Path::new("/tmp"));
 
         assert!(allow.iter().any(|p| p == Path::new("/tmp")));
+    }
+
+    #[test]
+    fn compute_allow_deny_paths_adds_existing_protected_paths_once() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ai-sandbox-windows-paths-{suffix}"));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+
+        let git_path = root.join(".git");
+        let policy = WindowsSandboxPolicy {
+            read_allow: vec![root.clone()],
+            write_deny: vec![git_path.clone()],
+            network_allowed: false,
+            use_private_desktop: true,
+        };
+        let (allow, deny) = compute_allow_deny_paths(&policy, &root);
+
+        assert_eq!(allow, vec![root.clone()]);
+        assert_eq!(deny.len(), 3);
+        assert!(deny.contains(&git_path));
+        assert!(deny.contains(&root.join(".codex")));
+        assert!(deny.contains(&root.join(".agents")));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -354,6 +354,25 @@ mod tests {
     fn test_bwrap_finder() {
         let finder = BwrapFinder::new();
         let _ = finder.find();
+        let vendored = PathBuf::from("/custom/bwrap");
+        let finder = BwrapFinder {
+            system_path: None,
+            vendored_path: Some(vendored.clone()),
+        };
+        assert!(finder.is_available());
+        assert_eq!(finder.find(), Some(vendored));
+        let system = PathBuf::from("/usr/bin/bwrap");
+        let finder = BwrapFinder {
+            system_path: Some(system.clone()),
+            vendored_path: Some(PathBuf::from("/custom/bwrap")),
+        };
+        assert!(finder.is_available());
+        assert_eq!(finder.find(), Some(system));
+        assert!(!BwrapFinder {
+            system_path: None,
+            vendored_path: None,
+        }
+        .is_available());
     }
 
     #[test]
@@ -401,6 +420,87 @@ mod tests {
             Err(BwrapBuildError::UnsupportedNetworkPolicy(
                 crate::NetworkSandboxPolicy::Localhost
             ))
+        ));
+    }
+
+    #[test]
+    fn mount_builders_cover_existing_and_missing_paths_and_environment_filtering() {
+        let cwd = std::env::current_dir().unwrap();
+        let args = create_readonly_bwrap_command(
+            vec!["true".into()],
+            &cwd,
+            &[
+                ("PATH".into(), "/usr/bin".into()),
+                ("LD_PRELOAD".into(), "/tmp/inject.so".into()),
+                ("DYLD_INSERT_LIBRARIES".into(), "/tmp/inject.dylib".into()),
+                ("NODE_OPTIONS".into(), "--require inject".into()),
+            ],
+            crate::NetworkSandboxPolicy::FullAccess,
+        )
+        .unwrap();
+        assert!(args
+            .windows(3)
+            .any(|parts| parts == ["--setenv", "PATH", "/usr/bin"]));
+        assert!(!args.iter().any(|arg| arg == "LD_PRELOAD"
+            || arg == "DYLD_INSERT_LIBRARIES"
+            || arg == "NODE_OPTIONS"));
+
+        let empty_workspace = create_workspace_bwrap_command(
+            vec!["true".into()],
+            &cwd,
+            &[],
+            &[("PATH".into(), "/usr/bin".into())],
+            crate::NetworkSandboxPolicy::NoAccess,
+        )
+        .unwrap();
+        assert!(empty_workspace
+            .windows(3)
+            .any(|parts| parts == ["--setenv", "PATH", "/usr/bin"]));
+
+        let writable_workspace = create_workspace_bwrap_command(
+            vec!["true".into()],
+            &cwd,
+            std::slice::from_ref(&cwd),
+            &[],
+            crate::NetworkSandboxPolicy::NoAccess,
+        )
+        .unwrap();
+        let canonical_cwd = cwd.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(writable_workspace
+            .windows(3)
+            .any(|parts| parts == ["--bind", canonical_cwd.as_str(), canonical_cwd.as_str()]));
+
+        assert!(matches!(
+            create_full_access_bwrap_command(
+                vec!["true".into()],
+                &cwd,
+                &[],
+                crate::NetworkSandboxPolicy::Localhost,
+            ),
+            Err(BwrapBuildError::UnsupportedNetworkPolicy(
+                crate::NetworkSandboxPolicy::Localhost
+            ))
+        ));
+
+        let missing = std::env::temp_dir().join("ai-sandbox-missing-mount-path");
+        assert!(matches!(
+            create_readonly_bwrap_command(
+                vec!["true".into()],
+                &missing,
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::MissingMountPath(_))
+        ));
+        assert!(matches!(
+            create_workspace_bwrap_command(
+                vec!["true".into()],
+                &cwd,
+                &[missing],
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::MissingMountPath(_))
         ));
     }
 

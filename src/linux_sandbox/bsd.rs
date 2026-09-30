@@ -453,6 +453,51 @@ mod tests {
         assert!(s.contains("rpath"));
     }
 
+    #[test]
+    fn pledge_string_includes_every_enabled_promise() {
+        let promises = PledgePromises {
+            stdio: true,
+            rpath: true,
+            wpath: true,
+            cpath: true,
+            dpath: true,
+            fpath: true,
+            inet: true,
+            unix: true,
+            dns: true,
+            proc: true,
+            exec: true,
+            id: true,
+            chown: true,
+            flock: true,
+            tmppath: true,
+            error: true,
+        };
+        assert_eq!(
+            promises.to_pledge_string(),
+            "stdio rpath wpath cpath dpath fpath inet unix dns proc exec id chown flock tmppath error"
+        );
+    }
+
+    #[test]
+    fn pledge_string_is_empty_when_no_promises_are_enabled() {
+        assert_eq!(PledgePromises::default().to_pledge_string(), "");
+    }
+
+    #[test]
+    fn mock_adapters_accept_successful_enforcement() {
+        let capsicum = MockCapsicumApi {
+            calls: Cell::new(0),
+            fail: false,
+        };
+        enforce_capsicum(&capsicum).unwrap();
+        assert_eq!(capsicum.calls.get(), 1);
+
+        let pledge = MockPledgeApi::default();
+        enforce_pledge(&pledge, &PledgePromises::default_safe()).unwrap();
+        assert_eq!(pledge.execpromises.borrow().as_deref(), Some(""));
+    }
+
     // ============================================================================
     // 新增测试: create_pledge_promises_from_policy 函数
     // ============================================================================

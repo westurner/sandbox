@@ -41,6 +41,9 @@ fn is_loopback_host(host: &str) -> bool {
         host_lower.as_str(),
         "localhost" | "localhost6" | "ip6-localhost"
     ) || host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
         .parse::<IpAddr>()
         .is_ok_and(|address| address.is_loopback())
 }
@@ -280,6 +283,29 @@ mod tests {
         assert!(ports.contains(&8080));
     }
 
+    #[test]
+    fn proxy_env_parser_filters_invalid_non_loopback_and_deduplicates_ports() {
+        let env = HashMap::from([
+            ("HTTP_PROXY".into(), " localhost ".into()),
+            ("HTTPS_PROXY".into(), "https://127.0.0.1".into()),
+            ("ALL_PROXY".into(), "socks5h://[::1]:1080".into()),
+            ("http_proxy".into(), "http://localhost:8080".into()),
+            ("https_proxy".into(), "http://192.168.1.1:3128".into()),
+            ("all_proxy".into(), "not a url".into()),
+        ]);
+        assert_eq!(
+            proxy_loopback_ports_from_env(&env),
+            vec![80, 443, 1080, 8080]
+        );
+
+        let ignored = HashMap::from([
+            ("HTTP_PROXY".into(), "  ".into()),
+            ("HTTPS_PROXY".into(), "http://0.0.0.0:8080".into()),
+            ("ALL_PROXY".into(), "http://example.com:1080".into()),
+        ]);
+        assert!(proxy_loopback_ports_from_env(&ignored).is_empty());
+    }
+
     // ============================================================================
     // 新增测试: Localhost 网络策略
     // ============================================================================
@@ -389,6 +415,7 @@ mod tests {
         assert!(is_loopback_host("localhost"));
         assert!(is_loopback_host("127.0.0.1"));
         assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
         assert!(is_loopback_host("127.0.0.2"));
         assert!(is_loopback_host("127.0.0.255"));
         assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
@@ -396,6 +423,7 @@ mod tests {
         assert!(!is_loopback_host("8.8.8.8"));
         assert!(!is_loopback_host("0.0.0.0"));
         assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("[2001:db8::1]"));
         assert!(!is_loopback_host("::1.attacker.example"));
     }
 }

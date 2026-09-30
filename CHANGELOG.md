@@ -40,7 +40,30 @@ allowing all network access, and runs mocked Seatbelt, Windows, Capsicum, and
 pledge adapter tests on Linux CI. Additional review rejects writable filesystem
 modes hidden inside a `ReadOnly` policy and fixes Windows command-line quoting
 for quotes and backslashes while passing the executable path separately to
-`CreateProcessAsUserW`. No CVE has been assigned to this disclosure.
+`CreateProcessAsUserW`.
+
+Execution-policy matching now prevents executable names from inheriting rules
+through string-prefix aliases, requires exact literal argument matches, and
+uses normalized component-boundary checks for working-directory restrictions.
+Restricted rules fail closed when their cwd or allowed-directory configuration
+is missing, while matching Deny and restricted wildcard rules take precedence
+over Allows. Path traversal in `--option=value` arguments is rejected, and the
+SUID/SGID guard recognizes absolute `chmod` paths and parses numeric modes as
+octal. Bubblewrap canonicalizes writable roots and rejects the filesystem root;
+however, because mounts are still passed by path, a concurrent path replacement
+between validation and Bubblewrap startup remains a TOCTOU limitation.
+
+TLA+ lifecycle models now cover the common executor and
+all five platform adapters, with TLC checks for fail-closed execution
+invariants. Five `cargo-fuzz` targets exercise policy parsing and adapter
+policy builders. Fuzzing found and fixed a UTF-8 boundary panic in execution
+policy sanitization; additional review tightened OpenBSD pledge networking
+promises and Windows restricted-process selection so unsupported protected
+policies cannot take an unrestricted path. Native tests and Windows, macOS, and
+FreeBSD cross-target checks pass. The models describe adapter lifecycle
+contracts and do not verify kernel enforcement semantics.
+
+No CVE has been requested or assigned to this disclosure.
 
 ## [0.2.1] - 2026-04-05
 

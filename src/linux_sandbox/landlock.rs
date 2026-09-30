@@ -121,4 +121,27 @@ mod tests {
     fn test_landlock_version() {
         let _ = get_landlock_version();
     }
+
+    #[test]
+    fn ruleset_descriptions_follow_kernel_availability_and_roots() {
+        if is_landlock_available() {
+            let readonly = create_readonly_ruleset().unwrap();
+            assert_eq!(readonly.handle_access_fs, landlock_access::READ_ONLY);
+
+            for roots in [&[][..], &[PathBuf::from("/workspace")][..]] {
+                let workspace = create_workspace_ruleset(roots).unwrap();
+                assert_eq!(
+                    workspace.handle_access_fs,
+                    if roots.is_empty() {
+                        landlock_access::READ_ONLY
+                    } else {
+                        landlock_access::READ_ONLY | landlock_access::ALL_FILE
+                    }
+                );
+            }
+        } else {
+            assert!(create_readonly_ruleset().is_none());
+            assert!(create_workspace_ruleset(&[]).is_none());
+        }
+    }
 }
