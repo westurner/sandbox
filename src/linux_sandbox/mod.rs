@@ -1,11 +1,14 @@
 //! Linux Sandbox Implementation
 //!
-//! Provides Linux sandboxing via bubblewrap, seccomp, and Landlock.
+//! Provides Linux sandboxing via Bubblewrap. Landlock helpers are capability
+//! metadata only and are not part of the active executor.
 
 mod bsd;
 mod landlock;
 
 pub mod bwrap;
+
+pub use bwrap::BwrapBuildError;
 
 pub use bsd::{
     create_pledge_promises_from_policy, execute_with_capsicum, execute_with_pledge,
@@ -13,12 +16,13 @@ pub use bsd::{
 };
 
 pub use landlock::{
-    create_linux_sandbox_command_args, create_readonly_ruleset, create_workspace_ruleset,
-    get_landlock_version, is_landlock_available, landlock_access,
+    create_readonly_ruleset, create_workspace_ruleset, get_landlock_version, is_landlock_available,
+    landlock_access,
 };
 
 use crate::SandboxPolicy;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use which::which;
@@ -44,14 +48,65 @@ pub fn system_bwrap_warning() -> Option<String> {
     }
 }
 
+/// Verify that Bubblewrap can create the namespaces required by the executor.
+pub fn ensure_bwrap_support() -> Result<(), String> {
+    let executable = find_system_bwrap_in_path()
+        .ok_or_else(|| "bubblewrap executable was not found in PATH".to_string())?;
+    let status = Command::new(&executable)
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/usr/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to probe bubblewrap: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("bubblewrap capability probe exited with {status}"))
+    }
+}
+
 /// Linux sandbox argument builder
 pub fn create_linux_sandbox_command_args_for_policies(
     argv: Vec<String>,
     cwd: &std::path::Path,
     policy: &SandboxPolicy,
-    use_legacy_landlock: bool,
-) -> Vec<String> {
-    landlock::create_linux_sandbox_command_args(argv, cwd, policy, use_legacy_landlock)
+    _use_legacy_landlock: bool,
+) -> Result<Vec<String>, BwrapBuildError> {
+    let env = [];
+    match policy.filesystem_policy() {
+        crate::FileSystemSandboxPolicy::FullAccess => {
+            bwrap::create_full_access_bwrap_command(argv, cwd, &env, policy.network_policy())
+        }
+        crate::FileSystemSandboxPolicy::ReadOnly => {
+            bwrap::create_readonly_bwrap_command(argv, cwd, &env, policy.network_policy())
+        }
+        crate::FileSystemSandboxPolicy::WorkspaceWrite { writable_roots } => {
+            bwrap::create_workspace_bwrap_command(
+                argv,
+                cwd,
+                &writable_roots,
+                &env,
+                policy.network_policy(),
+            )
+        }
+        crate::FileSystemSandboxPolicy::External => Err(
+            BwrapBuildError::UnsupportedFilesystemPolicy("external filesystem sandbox"),
+        ),
+    }
 }
 
 /// Linux sandbox arg0 constant
@@ -79,8 +134,9 @@ mod tests {
             std::path::Path::new("/tmp"),
             &policy,
             false,
-        );
+        )
+        .unwrap();
 
-        assert!(args.contains(&"--cwd".to_string()));
+        assert!(args.contains(&"--chdir".to_string()));
     }
 }

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 #[allow(unused_imports)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// Platform-specific sandbox types
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -21,7 +23,7 @@ pub enum SandboxType {
     None,
     /// macOS Seatbelt (sandbox-exec)
     MacosSeatbelt,
-    /// Linux Seccomp/Bubblewrap/Landlock
+    /// Linux Bubblewrap namespaces
     LinuxSeccomp,
     /// Windows Restricted Token
     WindowsRestrictedToken,
@@ -184,12 +186,20 @@ impl SandboxPolicy {
             // DangerFullAccess is not secure
             SandboxPolicy::DangerFullAccess => false,
             // ReadOnly is secure by default
-            SandboxPolicy::ReadOnly { .. } => true,
+            SandboxPolicy::ReadOnly { file_system, .. } => {
+                !matches!(file_system, FileSystemSandboxPolicy::External)
+            }
             // ExternalSandbox is not controlled by us, treat as potentially insecure
             SandboxPolicy::ExternalSandbox { .. } => false,
             // WorkspaceWrite must have non-empty writable_roots and no path traversal
             SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
                 if writable_roots.is_empty() {
+                    return false;
+                }
+                if writable_roots
+                    .iter()
+                    .any(|path| !path.is_absolute() || path == Path::new("/"))
+                {
                     return false;
                 }
                 // Check all paths for path traversal attacks
@@ -233,10 +243,80 @@ pub struct SandboxExecRequest {
     pub arg0: Option<String>,
 }
 
+impl SandboxExecRequest {
+    /// Spawn the transformed command through the selected sandbox backend.
+    pub fn spawn(&self) -> Result<Child, SandboxExecutionError> {
+        if self.command.is_empty() {
+            return Err(SandboxExecutionError::InvalidCommand(
+                "sandbox command is empty".to_string(),
+            ));
+        }
+
+        match self.sandbox {
+            #[cfg(target_os = "linux")]
+            SandboxType::LinuxSeccomp => {
+                crate::linux_sandbox::ensure_bwrap_support()
+                    .map_err(SandboxExecutionError::Unsupported)?;
+                self.spawn_transformed()
+            }
+            #[cfg(target_os = "macos")]
+            SandboxType::MacosSeatbelt => self.spawn_transformed(),
+            SandboxType::None => Err(SandboxExecutionError::Unsupported(
+                "unprotected execution is not available through SandboxExecRequest".to_string(),
+            )),
+            _ => Err(SandboxExecutionError::Unsupported(format!(
+                "sandbox backend {} has no verified executor on this platform",
+                self.sandbox.name()
+            ))),
+        }
+    }
+
+    /// Run the transformed command and terminate it when the timeout expires.
+    pub fn run(&self, timeout: Duration) -> Result<ExitStatus, SandboxExecutionError> {
+        let mut child = self.spawn()?;
+        let started = Instant::now();
+
+        loop {
+            if let Some(status) = child.try_wait().map_err(SandboxExecutionError::Io)? {
+                return Ok(status);
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SandboxExecutionError::TimedOut(timeout));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Spawn the transformed command and wait without a timeout.
+    pub fn wait(&self) -> Result<ExitStatus, SandboxExecutionError> {
+        let mut child = self.spawn()?;
+        child.wait().map_err(SandboxExecutionError::Io)
+    }
+
+    fn spawn_transformed(&self) -> Result<Child, SandboxExecutionError> {
+        let mut command = Command::new(&self.command[0]);
+        command.args(&self.command[1..]).current_dir(&self.cwd);
+        command.stdin(Stdio::inherit());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+        command.env_clear();
+        for (key, value) in &self.env {
+            if !is_unsafe_environment_key(key) {
+                command.env(key, value);
+            }
+        }
+        command.spawn().map_err(SandboxExecutionError::Io)
+    }
+}
+
 /// Sandbox transformation error
 #[derive(Debug)]
 pub enum SandboxTransformError {
-    MissingLinuxSandboxExecutable,
+    BubblewrapUnavailable,
+    BubblewrapBuild(String),
+    UnprotectedExecution,
     #[cfg(not(target_os = "macos"))]
     SeatbeltUnavailable,
     PlatformNotSupported,
@@ -247,8 +327,15 @@ pub enum SandboxTransformError {
 impl std::fmt::Display for SandboxTransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingLinuxSandboxExecutable => {
-                write!(f, "missing linux-sandbox executable path")
+            Self::BubblewrapUnavailable => write!(f, "bubblewrap executable is unavailable"),
+            Self::BubblewrapBuild(reason) => {
+                write!(f, "failed to build bubblewrap command: {reason}")
+            }
+            Self::UnprotectedExecution => {
+                write!(
+                    f,
+                    "unprotected execution is not allowed through the sandbox API"
+                )
             }
             #[cfg(not(target_os = "macos"))]
             Self::SeatbeltUnavailable => write!(f, "seatbelt sandbox is only available on macOS"),
@@ -259,6 +346,21 @@ impl std::fmt::Display for SandboxTransformError {
 }
 
 impl std::error::Error for SandboxTransformError {}
+
+/// Errors raised while starting or supervising a sandboxed process.
+#[derive(Debug, thiserror::Error)]
+pub enum SandboxExecutionError {
+    #[error("sandbox transformation failed: {0}")]
+    Transform(#[from] SandboxTransformError),
+    #[error("sandbox execution is unsupported: {0}")]
+    Unsupported(String),
+    #[error("invalid sandbox command: {0}")]
+    InvalidCommand(String),
+    #[error("sandbox process I/O failed: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("sandbox process exceeded timeout of {0:?}")]
+    TimedOut(Duration),
+}
 
 /// Get the appropriate sandbox type for the current platform
 pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType> {
@@ -330,8 +432,11 @@ impl SandboxManager {
             &FileSystemSandboxPolicy::default(),
             NetworkSandboxPolicy::default(),
             SandboxablePreference::Auto,
-            false,
+            cfg!(target_os = "windows"),
         );
+        if matches!(sandbox, SandboxType::None) {
+            return Err(SandboxTransformError::PlatformNotSupported);
+        }
         self.transform_command(command, policy, sandbox, None)
     }
 
@@ -343,54 +448,66 @@ impl SandboxManager {
         sandbox: SandboxType,
         _linux_sandbox_exe: Option<&Path>,
     ) -> Result<SandboxExecRequest, SandboxTransformError> {
-        let argv: Vec<OsString> = std::iter::once(command.program)
-            .chain(command.args.iter().map(OsString::from))
+        if !policy.is_safe() {
+            return Err(SandboxTransformError::UnsafePolicy(
+                "policy failed safety validation".to_string(),
+            ));
+        }
+        let SandboxCommand {
+            program,
+            args,
+            cwd,
+            env,
+        } = command;
+        let argv: Vec<OsString> = std::iter::once(program)
+            .chain(args.iter().map(OsString::from))
             .collect();
+        let argv = os_argv_to_strings(argv);
+        let _env_pairs: Vec<(String, String)> = env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        #[cfg(target_os = "windows")]
+        let _ = (&cwd, &argv);
 
         let (argv, arg0_override) = match sandbox {
-            SandboxType::None => (os_argv_to_strings(argv), None),
+            SandboxType::None => Err(SandboxTransformError::UnprotectedExecution),
             #[cfg(target_os = "macos")]
             SandboxType::MacosSeatbelt => {
                 let args = crate::sandboxing::seatbelt::create_seatbelt_command_args_for_policies(
-                    os_argv_to_strings(argv),
+                    argv,
                     &policy.filesystem_policy(),
                     policy.network_policy(),
-                    std::path::Path::new("."),
+                    &cwd,
                     false,
                     None,
                 );
                 let mut full_command = vec![MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string()];
                 full_command.extend(args);
-                (full_command, None)
+                Ok((full_command, None))
             }
             #[cfg(not(target_os = "macos"))]
-            SandboxType::MacosSeatbelt => return Err(SandboxTransformError::SeatbeltUnavailable),
+            SandboxType::MacosSeatbelt => Err(SandboxTransformError::SeatbeltUnavailable),
+            #[cfg(target_os = "linux")]
             SandboxType::LinuxSeccomp => {
-                let exe = _linux_sandbox_exe
-                    .ok_or(SandboxTransformError::MissingLinuxSandboxExecutable)?;
-                let args = create_linux_sandbox_args(&policy, command.cwd.as_path());
+                let exe = crate::linux_sandbox::find_system_bwrap_in_path()
+                    .ok_or(SandboxTransformError::BubblewrapUnavailable)?;
+                let args = create_linux_bwrap_args(&argv, &cwd, &_env_pairs, &policy)?;
                 let mut full_command = vec![exe.to_string_lossy().to_string()];
                 full_command.extend(args);
-                (full_command, Some("linux-sandbox".to_string()))
+                Ok((full_command, Some("bwrap".to_string())))
             }
-            #[cfg(target_os = "windows")]
-            SandboxType::WindowsRestrictedToken => (os_argv_to_strings(argv), None),
-            #[cfg(not(target_os = "windows"))]
-            SandboxType::WindowsRestrictedToken => (os_argv_to_strings(argv), None),
-            #[cfg(target_os = "freebsd")]
-            SandboxType::FreeBSDCapsicum => (os_argv_to_strings(argv), None),
-            #[cfg(not(target_os = "freebsd"))]
-            SandboxType::FreeBSDCapsicum => (os_argv_to_strings(argv), None),
-            #[cfg(target_os = "openbsd")]
-            SandboxType::OpenBSDPledge => (os_argv_to_strings(argv), None),
-            #[cfg(not(target_os = "openbsd"))]
-            SandboxType::OpenBSDPledge => (os_argv_to_strings(argv), None),
-        };
+            #[cfg(not(target_os = "linux"))]
+            SandboxType::LinuxSeccomp => Err(SandboxTransformError::PlatformNotSupported),
+            SandboxType::WindowsRestrictedToken
+            | SandboxType::FreeBSDCapsicum
+            | SandboxType::OpenBSDPledge => Err(SandboxTransformError::PlatformNotSupported),
+        }?;
 
         Ok(SandboxExecRequest {
             command: argv,
-            cwd: command.cwd,
-            env: command.env,
+            cwd,
+            env,
             sandbox,
             sandbox_policy: policy.clone(),
             file_system_policy: policy.filesystem_policy(),
@@ -409,6 +526,15 @@ fn os_argv_to_strings(argv: Vec<OsString>) -> Vec<String> {
         .collect()
 }
 
+fn is_unsafe_environment_key(key: &str) -> bool {
+    key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || matches!(
+            key,
+            "BASH_ENV" | "ENV" | "NODE_OPTIONS" | "PERL5OPT" | "PYTHONINSPECT" | "RUBYOPT"
+        )
+}
+
 fn should_require_platform_sandbox(
     file_system_policy: &FileSystemSandboxPolicy,
     network_policy: NetworkSandboxPolicy,
@@ -424,8 +550,45 @@ fn create_seatbelt_command_args(_policy: &SandboxPolicy) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_linux_sandbox_args(policy: &SandboxPolicy, cwd: &Path) -> Vec<String> {
-    crate::linux_sandbox::create_linux_sandbox_command_args_for_policies(vec![], cwd, policy, false)
+fn create_linux_bwrap_args(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    policy: &SandboxPolicy,
+) -> Result<Vec<String>, SandboxTransformError> {
+    let result = match policy.filesystem_policy() {
+        FileSystemSandboxPolicy::FullAccess => {
+            crate::linux_sandbox::bwrap::create_full_access_bwrap_command(
+                argv.to_vec(),
+                cwd,
+                env,
+                policy.network_policy(),
+            )
+        }
+        FileSystemSandboxPolicy::ReadOnly => {
+            crate::linux_sandbox::bwrap::create_readonly_bwrap_command(
+                argv.to_vec(),
+                cwd,
+                env,
+                policy.network_policy(),
+            )
+        }
+        FileSystemSandboxPolicy::WorkspaceWrite { writable_roots } => {
+            crate::linux_sandbox::bwrap::create_workspace_bwrap_command(
+                argv.to_vec(),
+                cwd,
+                &writable_roots,
+                env,
+                policy.network_policy(),
+            )
+        }
+        FileSystemSandboxPolicy::External => {
+            return Err(SandboxTransformError::UnsafePolicy(
+                "external filesystem policy cannot be enforced by the Linux backend".to_string(),
+            ))
+        }
+    };
+    result.map_err(|error| SandboxTransformError::BubblewrapBuild(error.to_string()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1008,5 +1171,98 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn test_sandbox_exec_request_carries_filesystem_policy() {
         // Skip on non-macOS as it requires platform-specific sandbox executable
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_executor_enforces_filesystem_boundaries() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if crate::linux_sandbox::ensure_bwrap_support().is_err() {
+            eprintln!("skipping Linux boundary test: Bubblewrap namespaces are unavailable");
+            return;
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before Unix epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ai-sandbox-boundary-{suffix}"));
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&outside, "outside").unwrap();
+
+        let manager = SandboxManager::new();
+        let readonly = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        let unreadable = manager
+            .create_exec_request(
+                SandboxCommand {
+                    program: OsString::from("/bin/sh"),
+                    args: vec!["-c".to_string(), format!("test ! -r {}", outside.display())],
+                    cwd: workspace.clone(),
+                    env: HashMap::new(),
+                },
+                readonly.clone(),
+            )
+            .unwrap();
+        assert!(unreadable.run(Duration::from_secs(2)).unwrap().success());
+
+        let blocked_write = manager
+            .create_exec_request(
+                SandboxCommand {
+                    program: OsString::from("/usr/bin/touch"),
+                    args: vec![workspace.join("blocked").display().to_string()],
+                    cwd: workspace.clone(),
+                    env: HashMap::new(),
+                },
+                readonly,
+            )
+            .unwrap();
+        assert!(!blocked_write.run(Duration::from_secs(2)).unwrap().success());
+        assert!(!workspace.join("blocked").exists());
+
+        let writable = manager
+            .create_exec_request(
+                SandboxCommand {
+                    program: OsString::from("/usr/bin/touch"),
+                    args: vec![workspace.join("allowed").display().to_string()],
+                    cwd: workspace.clone(),
+                    env: HashMap::new(),
+                },
+                SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![workspace.clone()],
+                    network_access: NetworkSandboxPolicy::NoAccess,
+                },
+            )
+            .unwrap();
+        assert!(writable.run(Duration::from_secs(2)).unwrap().success());
+        assert!(workspace.join("allowed").exists());
+
+        let literal_argument = manager
+            .create_exec_request(
+                SandboxCommand {
+                    program: OsString::from("/usr/bin/printf"),
+                    args: vec!["%s".to_string(), format!("$(touch {})", outside.display())],
+                    cwd: workspace.clone(),
+                    env: HashMap::new(),
+                },
+                SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![workspace.clone()],
+                    network_access: NetworkSandboxPolicy::NoAccess,
+                },
+            )
+            .unwrap();
+        assert!(literal_argument
+            .run(Duration::from_secs(2))
+            .unwrap()
+            .success());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+        fs::remove_dir_all(base).unwrap();
     }
 }

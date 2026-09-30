@@ -7,6 +7,18 @@ use which::which;
 
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, thiserror::Error)]
+pub enum BwrapBuildError {
+    #[error("bubblewrap cannot enforce network policy {0:?}")]
+    UnsupportedNetworkPolicy(crate::NetworkSandboxPolicy),
+    #[error("sandbox mount path does not exist: {0}")]
+    MissingMountPath(PathBuf),
+    #[error("sandbox path is not valid UTF-8: {0}")]
+    InvalidMountPath(PathBuf),
+    #[error("filesystem policy cannot be enforced by Bubblewrap: {0}")]
+    UnsupportedFilesystemPolicy(&'static str),
+}
+
 /// Bubblewrap executable finder
 pub struct BwrapFinder {
     system_path: Option<std::path::PathBuf>,
@@ -71,9 +83,9 @@ impl BwrapArgs {
         Self { args: Vec::new() }
     }
 
-    /// Set the working directory
+    /// Set the working directory inside the sandbox.
     pub fn cwd(mut self, path: &Path) -> Self {
-        self.args.push("--cwd".to_string());
+        self.args.push("--chdir".to_string());
         self.args.push(path.to_string_lossy().to_string());
         self
     }
@@ -86,9 +98,9 @@ impl BwrapArgs {
         self
     }
 
-    /// Mount a directory read-write
+    /// Mount a directory read-write.
     pub fn rw_bind(mut self, source: &Path, target: &Path) -> Self {
-        self.args.push("--rw".to_string());
+        self.args.push("--bind".to_string());
         self.args.push(source.to_string_lossy().to_string());
         self.args.push(target.to_string_lossy().to_string());
         self
@@ -97,6 +109,20 @@ impl BwrapArgs {
     /// Create a temporary directory
     pub fn tmp_dir(mut self, path: &str) -> Self {
         self.args.push("--tmpfs".to_string());
+        self.args.push(path.to_string());
+        self
+    }
+
+    /// Mount a device filesystem inside the sandbox.
+    pub fn dev(mut self, path: &str) -> Self {
+        self.args.push("--dev".to_string());
+        self.args.push(path.to_string());
+        self
+    }
+
+    /// Mount a proc filesystem inside the sandbox.
+    pub fn proc(mut self, path: &str) -> Self {
+        self.args.push("--proc".to_string());
         self.args.push(path.to_string());
         self
     }
@@ -113,9 +139,27 @@ impl BwrapArgs {
         self
     }
 
+    /// Unshare the process ID namespace.
+    pub fn unshare_pid(mut self) -> Self {
+        self.args.push("--unshare-pid".to_string());
+        self
+    }
+
     /// Unshare network namespace
     pub fn unshare_net(mut self) -> Self {
         self.args.push("--unshare-net".to_string());
+        self
+    }
+
+    /// Put the sandbox in a new session.
+    pub fn new_session(mut self) -> Self {
+        self.args.push("--new-session".to_string());
+        self
+    }
+
+    /// Ensure the sandbox exits when this process exits.
+    pub fn die_with_parent(mut self) -> Self {
+        self.args.push("--die-with-parent".to_string());
         self
     }
 
@@ -126,10 +170,17 @@ impl BwrapArgs {
         self
     }
 
-    /// Add a variable
+    /// Clear the inherited environment.
+    pub fn clear_env(mut self) -> Self {
+        self.args.push("--clearenv".to_string());
+        self
+    }
+
+    /// Add an explicit environment variable.
     pub fn env(mut self, key: &str, value: &str) -> Self {
-        self.args.push("--env".to_string());
-        self.args.push(format!("{}={}", key, value));
+        self.args.push("--setenv".to_string());
+        self.args.push(key.to_string());
+        self.args.push(value.to_string());
         self
     }
 
@@ -157,34 +208,137 @@ impl Default for BwrapArgs {
     }
 }
 
-/// Create a basic sandboxed bwrap command for read-only access
-pub fn create_readonly_bwrap_command(argv: Vec<String>, cwd: &Path) -> Vec<String> {
-    BwrapArgs::new()
-        .cwd(cwd)
-        .ro_bind(Path::new("/"), Path::new("/"))
-        .separator()
-        .command(argv)
-        .build()
+fn mount_path(path: &Path) -> Result<String, BwrapBuildError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| BwrapBuildError::MissingMountPath(path.to_path_buf()))?;
+    canonical
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| BwrapBuildError::InvalidMountPath(canonical))
 }
 
-/// Create a workspace bwrap command
+fn add_system_mounts(mut args: BwrapArgs) -> BwrapArgs {
+    for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
+        let path = Path::new(path);
+        if path.exists() {
+            args = args.ro_bind(path, path);
+        }
+    }
+
+    args.dev("/dev")
+        .proc("/proc")
+        .tmp_dir("/tmp")
+        .tmp_dir("/home")
+        .tmp_dir("/root")
+        .unshare_user()
+        .unshare_pid()
+        .unshare_ipc()
+        .new_session()
+        .die_with_parent()
+}
+
+fn add_process_isolation(args: BwrapArgs) -> BwrapArgs {
+    args.dev("/dev")
+        .proc("/proc")
+        .unshare_user()
+        .unshare_pid()
+        .unshare_ipc()
+        .new_session()
+        .die_with_parent()
+}
+
+/// Create a read-only Bubblewrap command with an isolated temporary directory.
+pub fn create_readonly_bwrap_command(
+    argv: Vec<String>,
+    cwd: &Path,
+    env: &[(String, String)],
+    network_access: crate::NetworkSandboxPolicy,
+) -> Result<Vec<String>, BwrapBuildError> {
+    let cwd = mount_path(cwd)?;
+    let mut args = add_system_mounts(BwrapArgs::new())
+        .ro_bind(Path::new(&cwd), Path::new(&cwd))
+        .cwd(Path::new(&cwd))
+        .clear_env();
+    args = add_network_policy(args, network_access)?;
+    for (key, value) in filtered_environment(env) {
+        args = args.env(key, value);
+    }
+    Ok(args.separator().command(argv).build())
+}
+
+/// Create a Bubblewrap command with explicit writable roots.
 pub fn create_workspace_bwrap_command(
     argv: Vec<String>,
     cwd: &Path,
     writable_roots: &[PathBuf],
-) -> Vec<String> {
-    let mut args = BwrapArgs::new();
-    args = args.cwd(cwd);
+    env: &[(String, String)],
+    network_access: crate::NetworkSandboxPolicy,
+) -> Result<Vec<String>, BwrapBuildError> {
+    let cwd = mount_path(cwd)?;
+    let mut args = add_system_mounts(BwrapArgs::new())
+        .ro_bind(Path::new(&cwd), Path::new(&cwd))
+        .cwd(Path::new(&cwd));
 
-    // Add writable roots
     for root in writable_roots {
-        args = args.rw_bind(root, root);
+        let root = mount_path(root)?;
+        args = args.rw_bind(Path::new(&root), Path::new(&root));
     }
 
-    // Mount everything else read-only
-    args = args.ro_bind(Path::new("/"), Path::new("/"));
+    args = args.clear_env();
+    args = add_network_policy(args, network_access)?;
+    for (key, value) in filtered_environment(env) {
+        args = args.env(key, value);
+    }
+    Ok(args.separator().command(argv).build())
+}
 
-    args.separator().command(argv).build()
+/// Create a Bubblewrap command while preserving full filesystem access.
+pub fn create_full_access_bwrap_command(
+    argv: Vec<String>,
+    cwd: &Path,
+    env: &[(String, String)],
+    network_access: crate::NetworkSandboxPolicy,
+) -> Result<Vec<String>, BwrapBuildError> {
+    let cwd = mount_path(cwd)?;
+    let mut args = add_process_isolation(
+        BwrapArgs::new()
+            .rw_bind(Path::new("/"), Path::new("/"))
+            .cwd(Path::new(&cwd))
+            .clear_env(),
+    );
+    args = add_network_policy(args, network_access)?;
+    for (key, value) in filtered_environment(env) {
+        args = args.env(key, value);
+    }
+    Ok(args.separator().command(argv).build())
+}
+
+fn add_network_policy(
+    args: BwrapArgs,
+    network_access: crate::NetworkSandboxPolicy,
+) -> Result<BwrapArgs, BwrapBuildError> {
+    match network_access {
+        crate::NetworkSandboxPolicy::NoAccess => Ok(args.unshare_net()),
+        crate::NetworkSandboxPolicy::FullAccess => Ok(args),
+        crate::NetworkSandboxPolicy::Localhost | crate::NetworkSandboxPolicy::Proxy => {
+            Err(BwrapBuildError::UnsupportedNetworkPolicy(network_access))
+        }
+    }
+}
+
+fn filtered_environment<'a>(
+    env: &'a [(String, String)],
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    env.iter().filter_map(|(key, value)| {
+        let unsafe_key = key.starts_with("LD_")
+            || key.starts_with("DYLD_")
+            || matches!(
+                key.as_str(),
+                "BASH_ENV" | "ENV" | "NODE_OPTIONS" | "PERL5OPT" | "PYTHONINSPECT" | "RUBYOPT"
+            );
+        (!unsafe_key).then_some((key.as_str(), value.as_str()))
+    })
 }
 
 #[cfg(test)]
@@ -206,7 +360,42 @@ mod tests {
             .command(vec!["ls".to_string()])
             .build();
 
-        assert!(args.contains(&"--cwd".to_string()));
+        assert!(args.contains(&"--chdir".to_string()));
         assert!(args.contains(&"--ro-bind".to_string()));
+    }
+
+    #[test]
+    fn test_bwrap_uses_supported_argument_names() {
+        let args = BwrapArgs::new()
+            .cwd(Path::new("/tmp"))
+            .rw_bind(Path::new("/tmp"), Path::new("/tmp"))
+            .clear_env()
+            .env("PATH", "/usr/bin")
+            .build();
+
+        assert!(args.contains(&"--chdir".to_string()));
+        assert!(args.contains(&"--bind".to_string()));
+        assert!(args.contains(&"--clearenv".to_string()));
+        assert!(args.contains(&"--setenv".to_string()));
+        assert!(!args.contains(&"--cwd".to_string()));
+        assert!(!args.contains(&"--rw".to_string()));
+        assert!(!args.contains(&"--env".to_string()));
+    }
+
+    #[test]
+    fn test_unsupported_network_policies_fail_closed() {
+        let result = create_readonly_bwrap_command(
+            vec!["true".to_string()],
+            Path::new("/tmp"),
+            &[],
+            crate::NetworkSandboxPolicy::Localhost,
+        );
+
+        assert!(matches!(
+            result,
+            Err(BwrapBuildError::UnsupportedNetworkPolicy(
+                crate::NetworkSandboxPolicy::Localhost
+            ))
+        ));
     }
 }

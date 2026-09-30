@@ -1,10 +1,10 @@
-//! Linux Landlock Implementation
+//! Linux Landlock capability metadata.
 //!
-//! Provides Linux sandboxing via Landlock filesystem sandboxing.
+//! Bubblewrap is the active Linux executor. These helpers only report kernel
+//! capability metadata; they do not install Landlock rules or enforce policy.
 
 #![allow(dead_code)]
 
-use crate::SandboxPolicy;
 use std::path::PathBuf;
 
 /// Landlock ruleset attribute flags
@@ -71,7 +71,7 @@ impl LandlockPathFd {
     }
 }
 
-/// Create Landlock ruleset for read-only access
+/// Describe the access mask a future Landlock executor would need for reads.
 pub fn create_readonly_ruleset() -> Option<LandlockRulesetAttr> {
     if !is_landlock_available() {
         return None;
@@ -82,7 +82,7 @@ pub fn create_readonly_ruleset() -> Option<LandlockRulesetAttr> {
     })
 }
 
-/// Create Landlock ruleset for workspace access
+/// Describe the access mask a future Landlock executor would need for writes.
 pub fn create_workspace_ruleset(writable_roots: &[PathBuf]) -> Option<LandlockRulesetAttr> {
     if !is_landlock_available() {
         return None;
@@ -111,64 +111,6 @@ pub fn get_landlock_version() -> Option<u32> {
     {
         None
     }
-}
-
-/// Linux sandbox argument builder with Landlock support
-pub fn create_linux_sandbox_command_args(
-    argv: Vec<String>,
-    cwd: &std::path::Path,
-    policy: &super::SandboxPolicy,
-    use_landlock_fallback: bool,
-) -> Vec<String> {
-    let mut args = vec![];
-
-    args.push("--cwd".to_string());
-    args.push(cwd.to_string_lossy().to_string());
-
-    let use_landlock = use_landlock_fallback && is_landlock_available();
-
-    if use_landlock {
-        args.push("--use-landlock".to_string());
-    }
-
-    match policy {
-        SandboxPolicy::ReadOnly { .. } => {
-            if use_landlock {
-                args.push("--landlock-ro".to_string());
-            } else {
-                args.push("--ro-bind".to_string());
-                args.push("/".to_string());
-                args.push("/".to_string());
-            }
-        }
-        SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
-            if use_landlock {
-                args.push("--landlock-rw".to_string());
-                for root in writable_roots {
-                    args.push("--landlock-allow-write".to_string());
-                    args.push(root.to_string_lossy().to_string());
-                }
-            } else {
-                for root in writable_roots {
-                    args.push("--rw".to_string());
-                    args.push(root.to_string_lossy().to_string());
-                }
-                args.push("--ro-bind".to_string());
-                args.push("/".to_string());
-                args.push("/".to_string());
-            }
-        }
-        SandboxPolicy::DangerFullAccess if use_landlock => {
-            args.push("--no-sandbox".to_string());
-        }
-        SandboxPolicy::DangerFullAccess => {}
-        _ => {}
-    }
-
-    args.push("--".to_string());
-    args.extend(argv);
-
-    args
 }
 
 #[cfg(test)]
