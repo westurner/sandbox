@@ -6,7 +6,7 @@ A Rust crate providing cross-platform sandbox isolation for AI agent tools.
 ## Features
 
 - **Multi-platform sandboxing**:
-  - Linux: Bubblewrap + Seccomp + Landlock
+    - Linux: Bubblewrap namespaces
   - macOS: Seatbelt (sandbox-exec)
   - Windows: Restricted Token
   - FreeBSD: Capsicum
@@ -21,11 +21,11 @@ A Rust crate providing cross-platform sandbox isolation for AI agent tools.
 
 | Platform | Sandbox Type | Status |
 |----------|--------------|--------|
-| Linux | Bubblewrap/Seccomp/Landlock | ✅ |
+| Linux | Bubblewrap namespaces | ✅ when host namespaces are available |
 | macOS | Seatbelt (sandbox-exec) | ✅ |
-| Windows | Restricted Token | ✅ |
-| FreeBSD | Capsicum | ✅ |
-| OpenBSD | pledge | ✅ |
+| Windows | Restricted Token | Specialized API; unsupported controls fail closed |
+| FreeBSD | Capsicum | Policy helpers; common executor unavailable |
+| OpenBSD | pledge | Policy helpers; common executor unavailable |
 
 ## Installation
 
@@ -231,12 +231,12 @@ if let Some(warning) = system_bwrap_warning() {
 let bwrap_path = find_system_bwrap_in_path();
 ```
 
-#### Linux with Landlock
+#### Linux Landlock capability metadata
 
 ```rust
 use ai_sandbox::linux_sandbox::landlock::{is_landlock_available, get_landlock_version};
 
-// Check Landlock support
+// Check kernel capability metadata. This is not an active executor.
 if is_landlock_available() {
     let version = get_landlock_version().unwrap_or(0);
     println!("Landlock version: {}", version);
@@ -348,13 +348,17 @@ apt install bubblewrap
 Uses the native `sandbox-exec` command (available in `/usr/bin/sandbox-exec`).
 
 ### Windows
-Uses Windows Restricted Token API. Requires Windows 10 version 1709 or later.
+Uses the Windows Restricted Token API where available. The common execution
+request rejects policies that require unavailable ACL or network enforcement;
+it never falls back to an unsandboxed process.
 
 ### FreeBSD
-Uses Capsicum framework for capability-mode sandboxing.
+Provides Capsicum policy and child-enforcement helpers. The common execution
+request rejects this backend until a verified process launcher is available.
 
 ### OpenBSD
-Uses the `pledge()` system call for system call filtering.
+Provides `pledge()` policy and child-enforcement helpers. The common execution
+request rejects this backend until a verified process launcher is available.
 
 ## License
 

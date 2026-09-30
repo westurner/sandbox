@@ -31,14 +31,17 @@ fn main() {
     };
 
     let sandbox_policy = match policy.as_str() {
-        "none" => SandboxPolicy::DangerFullAccess,
+        "none" => {
+            eprintln!("Error: policy 'none' is not permitted by sandbox-exec");
+            process::exit(1);
+        }
         "readonly" => SandboxPolicy::ReadOnly {
             file_system: FileSystemSandboxPolicy::ReadOnly,
             network_access: NetworkSandboxPolicy::NoAccess,
         },
         "workspace" => SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![PathBuf::from(".")],
-            network_access: NetworkSandboxPolicy::Localhost,
+            network_access: NetworkSandboxPolicy::NoAccess,
         },
         _ => {
             eprintln!("Unknown policy: {}", policy);
@@ -56,12 +59,13 @@ fn main() {
     let manager = SandboxManager::new();
 
     match manager.create_exec_request(cmd, sandbox_policy) {
-        Ok(_request) => {
-            println!("Sandbox policy applied: {}", policy);
-            // In a full implementation, this would actually execute the command
-            // with the sandboxed arguments
-            process::exit(0);
-        }
+        Ok(request) => match request.wait() {
+            Ok(status) => process::exit(status.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("Error executing sandboxed command: {}", e);
+                process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("Error creating sandbox request: {}", e);
             process::exit(1);
