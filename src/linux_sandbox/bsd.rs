@@ -232,6 +232,7 @@ pub fn is_pledge_available() -> bool {
 
 #[cfg(target_os = "freebsd")]
 mod freebsd_impl {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     /// Execute a command with capsicum sandbox
@@ -250,31 +251,20 @@ mod freebsd_impl {
             return cmd.spawn();
         }
 
-        // Build command that will call cap_enter() before exec
-        // We need to use a shell wrapper or spawn a child that enters capsicum
-        let capsicum_wrapper = format!("exec {}", args.join(" "));
-
         let mut cmd = Command::new(program);
         cmd.args(args);
         cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
 
-        // Note: In a real implementation, this would require either:
-        // 1. A wrapper binary that calls cap_enter() before exec
-        // 2. Using prctl to set up the sandbox before spawning
-        // 3. LD_PRELOAD or similar mechanism
-        //
-        // For now, we set an environment variable to indicate the sandbox should be enabled
-        // The actual enforcement would be done by a capsicum-enabled loader or wrapper
-        cmd.env(
-            "CAPSICUM_ENABLED",
-            match level {
-                super::CapsicumLevel::Basic => "basic",
-                super::CapsicumLevel::Strict => "strict",
-                _ => "disabled",
-            },
-        );
+        cmd.pre_exec(|| {
+            let result = unsafe { super::cap_enter() };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
 
         cmd.spawn()
     }
@@ -282,6 +272,7 @@ mod freebsd_impl {
 
 #[cfg(target_os = "openbsd")]
 mod openbsd_impl {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     // Import the pledge libc function
@@ -299,21 +290,24 @@ mod openbsd_impl {
         promises: &super::PledgePromises,
     ) -> std::io::Result<std::process::Child> {
         let promise_str = promises.to_pledge_string();
-        let promise_cstr = std::ffi::CString::new(promise_str).unwrap();
-        let empty_cstr = std::ffi::CString::new("").unwrap();
-
-        // Call pledge before exec
-        unsafe {
-            if pledge(promise_cstr.as_c_str(), empty_cstr.as_c_str()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
+        let promise_cstr = std::ffi::CString::new(promise_str).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pledge promises")
+        })?;
+        let empty_cstr = std::ffi::CString::new("").expect("empty CString is valid");
 
         let mut cmd = Command::new(program);
         cmd.args(args);
         cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
+
+        cmd.pre_exec(move || unsafe {
+            if pledge(promise_cstr.as_c_str(), empty_cstr.as_c_str()) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
 
         cmd.spawn()
     }

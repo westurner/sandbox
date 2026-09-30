@@ -59,6 +59,18 @@ fn proxy_scheme_default_port(scheme: &str) -> u16 {
     }
 }
 
+fn escape_sbpl_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn quote_sbpl_path(path: &Path) -> String {
+    format!("\"{}\"", escape_sbpl_string(&path.to_string_lossy()))
+}
+
 /// Get proxy ports from environment variables
 pub fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16> {
     let proxy_keys = [
@@ -111,7 +123,7 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
             "(version 1)".to_string()
         }
         super::SandboxPolicy::ReadOnly {
-            file_system: _,
+            file_system,
             network_access,
         } => {
             let mut sbpl = String::from("(version 1)\n(deny default)\n");
@@ -120,8 +132,9 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
             sbpl.push_str("(allow process-exec)\n");
             sbpl.push_str("(allow process-fork)\n");
 
-            // File read access
-            sbpl.push_str("(allow file-read*)\n");
+            if !matches!(file_system, super::FileSystemSandboxPolicy::External) {
+                sbpl.push_str("(allow file-read*)\n");
+            }
 
             // Network access based on policy
             match network_access {
@@ -168,8 +181,8 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
             // File write access to specific roots
             for root in writable_roots {
                 sbpl.push_str(&format!(
-                    "(allow file-write* (subpath \"{}\"))\n",
-                    root.display()
+                    "(allow file-write* (subpath {}))\n",
+                    quote_sbpl_path(root)
                 ));
             }
 
@@ -199,24 +212,21 @@ pub fn create_seatbelt_policy(policy: &super::SandboxPolicy) -> String {
 /// Create Seatbelt command arguments from policy
 pub fn create_seatbelt_command_args_for_policies(
     argv: Vec<String>,
-    _file_system_policy: &super::FileSystemSandboxPolicy,
+    file_system_policy: &super::FileSystemSandboxPolicy,
     network_policy: super::NetworkSandboxPolicy,
     _cwd: &Path,
     _enforce_managed_network: bool,
     _network: Option<&()>,
 ) -> Vec<String> {
-    // Create basic policy
-    let policy = match network_policy {
-        super::NetworkSandboxPolicy::FullAccess => super::SandboxPolicy::ReadOnly {
-            file_system: super::FileSystemSandboxPolicy::ReadOnly,
-            network_access: network_policy,
-        },
-        super::NetworkSandboxPolicy::NoAccess => super::SandboxPolicy::ReadOnly {
-            file_system: super::FileSystemSandboxPolicy::ReadOnly,
-            network_access: network_policy,
-        },
-        _ => super::SandboxPolicy::ReadOnly {
-            file_system: super::FileSystemSandboxPolicy::ReadOnly,
+    let policy = match file_system_policy {
+        super::FileSystemSandboxPolicy::WorkspaceWrite { writable_roots } => {
+            super::SandboxPolicy::WorkspaceWrite {
+                writable_roots: writable_roots.clone(),
+                network_access: network_policy,
+            }
+        }
+        file_system_policy => super::SandboxPolicy::ReadOnly {
+            file_system: file_system_policy.clone(),
             network_access: network_policy,
         },
     };

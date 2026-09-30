@@ -16,6 +16,7 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 #[allow(unused_imports)]
 use windows_sys::Win32::Security::CreateWellKnownSid;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 #[allow(unused_imports)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
@@ -151,7 +152,7 @@ pub unsafe fn create_process_as_user(
         si.hStdError = stderr_handle;
     } else {
         // Otherwise use current process handles
-        let _ = ensure_inheritable_stdio(&mut si);
+        ensure_inheritable_stdio(&mut si)?;
     }
 
     // Set up desktop (for private desktop support)
@@ -214,24 +215,47 @@ pub unsafe fn spawn_process_with_pipes(
     let mut out_w: HANDLE = std::ptr::null_mut();
     let mut err_r: HANDLE = std::ptr::null_mut();
     let mut err_w: HANDLE = std::ptr::null_mut();
+    let mut security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: 1,
+    };
 
     unsafe {
-        if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
+        if CreatePipe(&mut in_r, &mut in_w, &mut security_attributes, 0) == 0 {
             return Err(format!("CreatePipe stdin failed: {}", GetLastError()));
         }
-        if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
+        if CreatePipe(&mut out_r, &mut out_w, &mut security_attributes, 0) == 0 {
             CloseHandle(in_r);
             CloseHandle(in_w);
             return Err(format!("CreatePipe stdout failed: {}", GetLastError()));
         }
         if stderr_mode == StderrMode::Separate
-            && CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0
+            && CreatePipe(&mut err_r, &mut err_w, &mut security_attributes, 0) == 0
         {
             CloseHandle(in_r);
             CloseHandle(in_w);
             CloseHandle(out_r);
             CloseHandle(out_w);
             return Err(format!("CreatePipe stderr failed: {}", GetLastError()));
+        }
+
+        for handle in [in_w, out_r, err_r]
+            .into_iter()
+            .filter(|handle| !handle.is_null())
+        {
+            if windows_sys::Win32::Foundation::SetHandleInformation(handle, 1, 0) == 0 {
+                let error = GetLastError();
+                CloseHandle(in_r);
+                CloseHandle(in_w);
+                CloseHandle(out_r);
+                CloseHandle(out_w);
+                if stderr_mode == StderrMode::Separate {
+                    CloseHandle(err_r);
+                    CloseHandle(err_w);
+                }
+                return Err(format!("SetHandleInformation failed: {}", error));
+            }
         }
     }
 
