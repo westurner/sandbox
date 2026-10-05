@@ -143,6 +143,15 @@ pub fn create_linux_sandbox_command_args_for_policies(
         crate::FileSystemSandboxPolicy::ReadOnly => {
             bwrap::create_readonly_bwrap_command(argv, cwd, &env, policy.network_policy())
         }
+        crate::FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots } => {
+            bwrap::create_readonly_bwrap_command_with_roots(
+                argv,
+                cwd,
+                &read_only_roots,
+                &env,
+                policy.network_policy(),
+            )
+        }
         crate::FileSystemSandboxPolicy::WorkspaceWrite { writable_roots } => {
             bwrap::create_workspace_bwrap_command(
                 argv,

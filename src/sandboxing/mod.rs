@@ -10,7 +10,7 @@ pub use seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
 use std::collections::HashMap;
 #[allow(unused_imports)]
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,8 @@ pub enum FileSystemSandboxPolicy {
     FullAccess,
     /// Read-only access
     ReadOnly,
+    /// Read-only access to the working directory and explicitly listed roots.
+    ReadOnlyWithRoots { read_only_roots: Vec<PathBuf> },
     /// Workspace-only write access
     WorkspaceWrite {
         /// Allowed writable roots
@@ -186,9 +188,20 @@ impl SandboxPolicy {
             SandboxPolicy::DangerFullAccess => false,
             // The ReadOnly variant must not introduce a more permissive
             // filesystem policy that then selects a writable backend.
-            SandboxPolicy::ReadOnly { file_system, .. } => {
-                matches!(file_system, FileSystemSandboxPolicy::ReadOnly)
-            }
+            SandboxPolicy::ReadOnly { file_system, .. } => match file_system {
+                FileSystemSandboxPolicy::ReadOnly => true,
+                FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots } => {
+                    !read_only_roots.is_empty()
+                        && read_only_roots.iter().all(|path| {
+                            path.is_absolute()
+                                && path != Path::new("/")
+                                && !path
+                                    .components()
+                                    .any(|component| component == Component::ParentDir)
+                        })
+                }
+                _ => false,
+            },
             // ExternalSandbox is not controlled by us, treat as potentially insecure
             SandboxPolicy::ExternalSandbox { .. } => false,
             // WorkspaceWrite must have non-empty writable_roots and no path traversal
@@ -280,6 +293,34 @@ impl SandboxExecRequest {
         }
     }
 
+    /// Spawn the transformed command with piped stdin, stdout, and stderr.
+    /// The caller owns draining stdout/stderr to avoid blocking the child.
+    pub fn spawn_with_stdio(&self) -> Result<Child, SandboxExecutionError> {
+        if self.execution.command.is_empty() {
+            return Err(SandboxExecutionError::InvalidCommand(
+                "sandbox command is empty".to_string(),
+            ));
+        }
+
+        match self.execution.sandbox {
+            #[cfg(target_os = "linux")]
+            SandboxType::LinuxSeccomp => {
+                crate::linux_sandbox::ensure_bwrap_support()
+                    .map_err(SandboxExecutionError::Unsupported)?;
+                self.spawn_transformed_with_stdio()
+            }
+            #[cfg(target_os = "macos")]
+            SandboxType::MacosSeatbelt => self.spawn_transformed_with_stdio(),
+            SandboxType::None => Err(SandboxExecutionError::Unsupported(
+                "unprotected execution is not available through SandboxExecRequest".to_string(),
+            )),
+            _ => Err(SandboxExecutionError::Unsupported(format!(
+                "sandbox backend {} has no verified executor on this platform",
+                self.sandbox.name()
+            ))),
+        }
+    }
+
     /// Run the transformed command and terminate it when the timeout expires.
     pub fn run(&self, timeout: Duration) -> Result<ExitStatus, SandboxExecutionError> {
         self.run_with_spawn(timeout, |request| request.spawn())
@@ -325,14 +366,40 @@ impl SandboxExecRequest {
             .map_err(SandboxExecutionError::Io)
     }
 
+    fn spawn_transformed_with_stdio(&self) -> Result<Child, SandboxExecutionError> {
+        self.command_for_spawn_with_stdio()
+            .spawn()
+            .map_err(SandboxExecutionError::Io)
+    }
+
     fn command_for_spawn(&self) -> Command {
+        self.command_for_spawn_with_io(false)
+    }
+
+    fn command_for_spawn_with_stdio(&self) -> Command {
+        self.command_for_spawn_with_io(true)
+    }
+
+    fn command_for_spawn_with_io(&self, piped: bool) -> Command {
         let mut command = Command::new(&self.execution.command[0]);
         command
             .args(&self.execution.command[1..])
             .current_dir(&self.execution.cwd);
-        command.stdin(Stdio::inherit());
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        let stdio = if piped {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        };
+        command.stdin(stdio).stdout(if piped {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
+        command.stderr(if piped {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
         command.env_clear();
         for (key, value) in &self.execution.env {
             if !is_unsafe_environment_key(key) {
@@ -475,6 +542,37 @@ impl SandboxManager {
         self.transform_command(command, policy, sandbox, None)
     }
 
+    /// Create a read-only sandbox request with explicitly mounted additional roots.
+    pub fn create_exec_request_with_read_only_roots(
+        &self,
+        command: SandboxCommand,
+        policy: SandboxPolicy,
+        mut read_only_roots: Vec<PathBuf>,
+    ) -> Result<SandboxExecRequest, SandboxTransformError> {
+        let SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access,
+        } = policy
+        else {
+            return Err(SandboxTransformError::UnsupportedPolicy(
+                "additional read-only roots require a ReadOnly policy".into(),
+            ));
+        };
+        if !command.cwd.is_absolute() {
+            return Err(SandboxTransformError::UnsafePolicy(
+                "read-only sandbox cwd must be absolute".into(),
+            ));
+        }
+        read_only_roots.push(command.cwd.clone());
+        self.create_exec_request(
+            command,
+            SandboxPolicy::ReadOnly {
+                file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots },
+                network_access,
+            },
+        )
+    }
+
     /// Transform a command for sandbox execution
     pub fn transform_command(
         &self,
@@ -483,17 +581,18 @@ impl SandboxManager {
         sandbox: SandboxType,
         _linux_sandbox_exe: Option<&Path>,
     ) -> Result<SandboxExecRequest, SandboxTransformError> {
-        if !policy.is_safe() {
-            return Err(SandboxTransformError::UnsafePolicy(
-                "policy failed safety validation".to_string(),
-            ));
-        }
         let SandboxCommand {
             program,
             args,
             cwd,
             env,
         } = command;
+        let (policy, cwd) = normalize_read_only_roots(policy, &cwd)?;
+        if !policy.is_safe() {
+            return Err(SandboxTransformError::UnsafePolicy(
+                "policy failed safety validation".to_string(),
+            ));
+        }
         let argv: Vec<OsString> = std::iter::once(program)
             .chain(args.iter().map(OsString::from))
             .collect();
@@ -559,6 +658,69 @@ impl SandboxManager {
     }
 }
 
+fn normalize_read_only_roots(
+    policy: SandboxPolicy,
+    cwd: &Path,
+) -> Result<(SandboxPolicy, PathBuf), SandboxTransformError> {
+    let SandboxPolicy::ReadOnly {
+        file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots },
+        network_access,
+    } = policy
+    else {
+        return Ok((policy, cwd.to_path_buf()));
+    };
+
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|error| SandboxTransformError::UnsafePolicy(format!("invalid cwd: {error}")))?;
+    let mut canonical_roots = vec![canonical_cwd.clone()];
+    for root in read_only_roots {
+        if !root.is_absolute()
+            || root == Path::new("/")
+            || root
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(SandboxTransformError::UnsafePolicy(format!(
+                "invalid read-only root: {}",
+                root.display()
+            )));
+        }
+        let root = root.canonicalize().map_err(|error| {
+            SandboxTransformError::UnsafePolicy(format!(
+                "unable to canonicalize read-only root {}: {error}",
+                root.display()
+            ))
+        })?;
+        if root == Path::new("/") {
+            return Err(SandboxTransformError::UnsafePolicy(
+                "filesystem root cannot be an additional read-only mount".into(),
+            ));
+        }
+        if canonical_cwd.starts_with(&root) && canonical_cwd != root {
+            return Err(SandboxTransformError::UnsafePolicy(format!(
+                "read-only root {} contains the working directory",
+                root.display()
+            )));
+        }
+        if root != canonical_cwd && !root.starts_with(&canonical_cwd) {
+            canonical_roots.push(root);
+        }
+    }
+    canonical_roots.sort();
+    canonical_roots.dedup();
+
+    Ok((
+        SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots {
+                read_only_roots: canonical_roots,
+            },
+            network_access,
+        },
+        canonical_cwd,
+    ))
+}
+
 fn os_argv_to_strings(argv: Vec<OsString>) -> Vec<String> {
     argv.into_iter()
         .map(|s| {
@@ -611,6 +773,15 @@ fn create_linux_bwrap_args(
             crate::linux_sandbox::bwrap::create_readonly_bwrap_command(
                 argv.to_vec(),
                 cwd,
+                env,
+                policy.network_policy(),
+            )
+        }
+        FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots } => {
+            crate::linux_sandbox::bwrap::create_readonly_bwrap_command_with_roots(
+                argv.to_vec(),
+                cwd,
+                &read_only_roots,
                 env,
                 policy.network_policy(),
             )
@@ -710,6 +881,69 @@ mod tests {
                 sandbox,
             },
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_with_stdio_reads_explicit_roots_and_round_trips_stdin() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if let Err(error) = crate::linux_sandbox::ensure_bwrap_support() {
+            eprintln!("skipping Bubblewrap runtime test: {error}");
+            return;
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace_parent = std::env::temp_dir().join(format!("ai-sandbox-workspace-{unique}"));
+        let toolchain_root = std::env::temp_dir().join(format!("ai-sandbox-toolchain-{unique}"));
+        std::fs::create_dir_all(&workspace_parent).unwrap();
+        std::fs::create_dir_all(&toolchain_root).unwrap();
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+        let _cleanup = Cleanup(vec![workspace_parent.clone(), toolchain_root.clone()]);
+
+        let workspace = workspace_parent.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let toolchain_file = toolchain_root.join("runtime.txt");
+        std::fs::write(&toolchain_file, b"toolchain").unwrap();
+        let command = SandboxCommand {
+            program: "/usr/bin/cat".into(),
+            args: vec![toolchain_file.to_string_lossy().into_owned(), "-".into()],
+            cwd: workspace,
+            env: HashMap::new(),
+        };
+        let policy = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        let request = SandboxManager::new()
+            .create_exec_request_with_read_only_roots(command, policy, vec![toolchain_root])
+            .unwrap();
+
+        let mut child = request.spawn_with_stdio().unwrap();
+        let mut stdin = child.stdin.take().expect("stdin should be piped");
+        assert!(child.stdout.is_some(), "stdout should be piped");
+        assert!(child.stderr.is_some(), "stderr should be piped");
+        stdin.write_all(b"+stdin").unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"toolchain+stdin");
     }
 
     #[test]
@@ -1030,6 +1264,106 @@ mod tests {
                 path
             );
         }
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "ai-sandbox-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_only_roots_policy_requires_absolute_non_root_paths() {
+        let policy = |roots| SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots {
+                read_only_roots: roots,
+            },
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+
+        assert!(policy(vec![
+            PathBuf::from("/workspace"),
+            PathBuf::from("/toolchain")
+        ])
+        .is_safe());
+        assert!(!policy(vec![PathBuf::from("relative")]).is_safe());
+        assert!(!policy(vec![PathBuf::from("/")]).is_safe());
+        assert!(!policy(vec![PathBuf::from("/opt/../etc")]).is_safe());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manager_includes_read_only_roots_in_prepared_bwrap_command() {
+        let workspace = TestDirectory::new("workspace");
+        let toolchain = TestDirectory::new("toolchain");
+        let command = SandboxCommand {
+            program: "/usr/bin/cat".into(),
+            args: Vec::new(),
+            cwd: workspace.0.clone(),
+            env: HashMap::new(),
+        };
+        let policy = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+
+        let request = SandboxManager::new()
+            .create_exec_request_with_read_only_roots(command, policy, vec![toolchain.0.clone()])
+            .unwrap();
+
+        let toolchain = toolchain
+            .0
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            &request.file_system_policy,
+            FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots }
+                if read_only_roots.iter().any(|root| root == Path::new(&toolchain))
+        ));
+        assert!(request
+            .command
+            .windows(3)
+            .any(|parts| { parts == ["--ro-bind", toolchain.as_str(), toolchain.as_str()] }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_command_builder_round_trips_stdin_to_stdout() {
+        use std::io::Write;
+
+        let mut request = request_for_process_tests("/bin/cat", SandboxType::LinuxSeccomp);
+        request.execution.command.push("-".into());
+        let mut child = request.command_for_spawn_with_stdio().spawn().unwrap();
+        let mut stdin = child.stdin.take().expect("stdin should be piped");
+        assert!(child.stdout.is_some(), "stdout should be piped");
+        assert!(child.stderr.is_some(), "stderr should be piped");
+        stdin.write_all(b"piped").unwrap();
+        drop(stdin);
+
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"piped");
     }
 
     #[test]

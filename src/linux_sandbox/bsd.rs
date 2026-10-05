@@ -215,6 +215,13 @@ pub fn create_pledge_promises_from_policy(
             promises.wpath = false;
             promises.cpath = false;
         }
+        crate::FileSystemSandboxPolicy::ReadOnlyWithRoots { .. } => {
+            // Pledge cannot express path-scoped reads; deny reads rather than
+            // widening this policy to global rpath access.
+            promises.rpath = false;
+            promises.wpath = false;
+            promises.cpath = false;
+        }
         crate::FileSystemSandboxPolicy::WorkspaceWrite { .. } => {
             // Allow read and some write
             promises.rpath = true;
@@ -531,6 +538,19 @@ mod tests {
         // NoAccess should deny network
         assert!(!s.contains("inet"));
         assert!(!s.contains("dns"));
+    }
+
+    #[test]
+    fn pledge_fails_closed_for_path_scoped_read_only_roots() {
+        let promises = create_pledge_promises_from_policy(
+            &crate::FileSystemSandboxPolicy::ReadOnlyWithRoots {
+                read_only_roots: vec![std::path::PathBuf::from("/workspace")],
+            },
+            crate::NetworkSandboxPolicy::NoAccess,
+        );
+        assert!(!promises.rpath);
+        assert!(!promises.wpath);
+        assert!(!promises.cpath);
     }
 
     #[test]

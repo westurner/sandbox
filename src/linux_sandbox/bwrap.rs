@@ -5,6 +5,7 @@
 #[cfg(target_os = "linux")]
 use which::which;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +18,10 @@ pub enum BwrapBuildError {
     InvalidMountPath(PathBuf),
     #[error("filesystem root cannot be mounted writable: {0}")]
     WritableFilesystemRoot(PathBuf),
+    #[error("filesystem root cannot be exposed as an additional read-only root")]
+    ReadOnlyFilesystemRoot,
+    #[error("read-only root would expose the workspace parent: {0}")]
+    ReadOnlyRootContainsWorkspace(PathBuf),
     #[error("filesystem policy cannot be enforced by Bubblewrap: {0}")]
     UnsupportedFilesystemPolicy(&'static str),
 }
@@ -88,6 +93,13 @@ impl BwrapArgs {
     /// Set the working directory inside the sandbox.
     pub fn cwd(mut self, path: &Path) -> Self {
         self.args.push("--chdir".to_string());
+        self.args.push(path.to_string_lossy().to_string());
+        self
+    }
+
+    /// Create a directory in the sandbox root filesystem.
+    pub fn dir(mut self, path: &Path) -> Self {
+        self.args.push("--dir".to_string());
         self.args.push(path.to_string_lossy().to_string());
         self
     }
@@ -257,11 +269,24 @@ pub fn create_readonly_bwrap_command(
     env: &[(String, String)],
     network_access: crate::NetworkSandboxPolicy,
 ) -> Result<Vec<String>, BwrapBuildError> {
+    create_readonly_bwrap_command_with_roots(argv, cwd, &[], env, network_access)
+}
+
+/// Create a read-only Bubblewrap command with additional explicit read-only roots.
+/// The cwd is already mounted read-only; roots inside it are therefore redundant.
+pub fn create_readonly_bwrap_command_with_roots(
+    argv: Vec<String>,
+    cwd: &Path,
+    read_only_roots: &[PathBuf],
+    env: &[(String, String)],
+    network_access: crate::NetworkSandboxPolicy,
+) -> Result<Vec<String>, BwrapBuildError> {
     let cwd = mount_path(cwd)?;
     let mut args = add_system_mounts(BwrapArgs::new())
         .ro_bind(Path::new(&cwd), Path::new(&cwd))
         .cwd(Path::new(&cwd))
         .clear_env();
+    args = add_read_only_roots(args, read_only_roots, Path::new(&cwd))?;
     args = add_network_policy(args, network_access)?;
     for (key, value) in filtered_environment(env) {
         args = args.env(key, value);
@@ -330,6 +355,67 @@ fn add_network_policy(
             Err(BwrapBuildError::UnsupportedNetworkPolicy(network_access))
         }
     }
+}
+
+fn add_read_only_roots(
+    mut args: BwrapArgs,
+    roots: &[PathBuf],
+    cwd: &Path,
+) -> Result<BwrapArgs, BwrapBuildError> {
+    let mut canonical_roots = Vec::new();
+    for root in roots {
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(BwrapBuildError::UnsupportedFilesystemPolicy(
+                "read-only roots must be absolute canonical paths",
+            ));
+        }
+        let root = PathBuf::from(mount_path(root)?);
+        if root == Path::new("/") {
+            return Err(BwrapBuildError::ReadOnlyFilesystemRoot);
+        }
+        if root == cwd || root.starts_with(cwd) || is_system_mounted(&root) {
+            continue;
+        }
+        if cwd.starts_with(&root) {
+            return Err(BwrapBuildError::ReadOnlyRootContainsWorkspace(root));
+        }
+        canonical_roots.push(root);
+    }
+    canonical_roots.sort();
+    canonical_roots.dedup();
+
+    let mut created_dirs = HashSet::new();
+    for root in canonical_roots {
+        let mut parents = root.ancestors().skip(1).collect::<Vec<_>>();
+        parents.reverse();
+        for parent in parents {
+            if parent == Path::new("/")
+                || parent == Path::new("/tmp")
+                || parent == Path::new("/home")
+                || parent == Path::new("/root")
+                || parent == cwd
+                || cwd.starts_with(parent)
+                || is_system_mounted(parent)
+            {
+                continue;
+            }
+            if created_dirs.insert(parent.to_path_buf()) {
+                args = args.dir(parent);
+            }
+        }
+        args = args.ro_bind(&root, &root);
+    }
+    Ok(args)
+}
+
+fn is_system_mounted(path: &Path) -> bool {
+    ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
+        .iter()
+        .any(|root| path == Path::new(root) || path.starts_with(root))
 }
 
 fn filtered_environment<'a>(
@@ -404,6 +490,57 @@ mod tests {
         assert!(!args.contains(&"--cwd".to_string()));
         assert!(!args.contains(&"--rw".to_string()));
         assert!(!args.contains(&"--env".to_string()));
+    }
+
+    #[test]
+    fn readonly_builder_mounts_configured_roots_and_creates_target_parents() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cwd_root = std::env::temp_dir().join(format!("ai-sandbox-cwd-{unique}"));
+        let tool_root = std::env::temp_dir().join(format!("ai-sandbox-tool-{unique}"));
+        let cwd = cwd_root.join("workspace");
+        let toolchain = tool_root.join(".rustup").join("toolchains").join("stable");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&toolchain).unwrap();
+
+        let args = create_readonly_bwrap_command_with_roots(
+            vec!["/usr/bin/true".into()],
+            &cwd,
+            std::slice::from_ref(&toolchain),
+            &[],
+            crate::NetworkSandboxPolicy::NoAccess,
+        )
+        .unwrap();
+        let cwd = cwd.canonicalize().unwrap().to_string_lossy().into_owned();
+        let toolchain = toolchain
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let tool_parent = tool_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(args
+            .windows(3)
+            .any(|parts| { parts == ["--ro-bind", toolchain.as_str(), toolchain.as_str()] }));
+        assert!(args
+            .windows(2)
+            .any(|parts| { parts == ["--dir", tool_parent.as_str()] }));
+        assert!(args
+            .windows(3)
+            .any(|parts| { parts == ["--ro-bind", cwd.as_str(), cwd.as_str()] }));
+        assert!(!args
+            .windows(3)
+            .any(|parts| { parts == ["--bind", toolchain.as_str(), toolchain.as_str()] }));
+
+        std::fs::remove_dir_all(cwd_root).unwrap();
+        std::fs::remove_dir_all(tool_root).unwrap();
     }
 
     #[test]

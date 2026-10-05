@@ -112,12 +112,14 @@ pub fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16> 
     ports.into_iter().collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SeatbeltPolicyError {
     #[error("Seatbelt cannot enforce the requested proxy network policy")]
     UnsupportedProxyNetworkPolicy,
     #[error("Seatbelt cannot enforce the requested external-sandbox network policy")]
     UnsupportedExternalNetworkPolicy,
+    #[error("invalid Seatbelt read-only root: {0}")]
+    InvalidReadOnlyRoot(String),
 }
 
 /// Create Seatbelt policy string from sandbox policy.
@@ -149,8 +151,41 @@ pub fn create_seatbelt_policy(
             sbpl.push_str("(allow process-exec)\n");
             sbpl.push_str("(allow process-fork)\n");
 
-            if !matches!(file_system, super::FileSystemSandboxPolicy::External) {
-                sbpl.push_str("(allow file-read*)\n");
+            match file_system {
+                super::FileSystemSandboxPolicy::External => {}
+                super::FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots } => {
+                    let mut roots = BTreeSet::new();
+                    for root in [
+                        "/System",
+                        "/usr",
+                        "/bin",
+                        "/sbin",
+                        "/Library/Apple/System/Library",
+                        "/private/var/db/dyld",
+                    ] {
+                        roots.insert(root.to_string());
+                    }
+                    for root in read_only_roots {
+                        if !root.is_absolute()
+                            || root == Path::new("/")
+                            || root
+                                .components()
+                                .any(|component| component == std::path::Component::ParentDir)
+                        {
+                            return Err(SeatbeltPolicyError::InvalidReadOnlyRoot(
+                                root.display().to_string(),
+                            ));
+                        }
+                        roots.insert(root.to_string_lossy().into_owned());
+                    }
+                    for root in roots {
+                        sbpl.push_str(&format!(
+                            "(allow file-read* (subpath {}))\n",
+                            quote_sbpl_path(Path::new(&root))
+                        ));
+                    }
+                }
+                _ => sbpl.push_str("(allow file-read*)\n"),
             }
 
             // Network access based on policy
@@ -269,6 +304,26 @@ mod tests {
         let sbpl = create_seatbelt_policy(&policy).unwrap();
         assert!(sbpl.contains("(deny default)"));
         assert!(sbpl.contains("(allow file-read*)"));
+    }
+
+    #[test]
+    fn readonly_roots_generate_scoped_file_read_rules() {
+        let policy = super::super::SandboxPolicy::ReadOnly {
+            file_system: super::super::FileSystemSandboxPolicy::ReadOnlyWithRoots {
+                read_only_roots: vec![
+                    Path::new("/workspace").to_path_buf(),
+                    Path::new("/toolchain").to_path_buf(),
+                ],
+            },
+            network_access: super::super::NetworkSandboxPolicy::NoAccess,
+        };
+
+        let sbpl = create_seatbelt_policy(&policy).unwrap();
+
+        assert!(sbpl.contains("(allow file-read* (subpath \"/workspace\"))"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/toolchain\"))"));
+        assert!(!sbpl.contains("(allow file-read*)\n"));
+        assert!(!sbpl.contains("(allow network*"));
     }
 
     #[test]
