@@ -296,6 +296,28 @@ impl SandboxExecRequest {
     /// Spawn the transformed command with piped stdin, stdout, and stderr.
     /// The caller owns draining stdout/stderr to avoid blocking the child.
     pub fn spawn_with_stdio(&self) -> Result<Child, SandboxExecutionError> {
+        self.spawn_with_stdio_in_group(false)
+    }
+
+    /// Spawn the transformed command with piped stdio in a new Unix process
+    /// group so the caller can terminate the sandbox wrapper and descendants.
+    pub fn spawn_with_stdio_in_process_group(&self) -> Result<Child, SandboxExecutionError> {
+        #[cfg(unix)]
+        {
+            self.spawn_with_stdio_in_group(true)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SandboxExecutionError::Unsupported(
+                "separate process groups are unavailable on this platform".into(),
+            ))
+        }
+    }
+
+    fn spawn_with_stdio_in_group(
+        &self,
+        process_group: bool,
+    ) -> Result<Child, SandboxExecutionError> {
         if self.execution.command.is_empty() {
             return Err(SandboxExecutionError::InvalidCommand(
                 "sandbox command is empty".to_string(),
@@ -307,10 +329,10 @@ impl SandboxExecRequest {
             SandboxType::LinuxSeccomp => {
                 crate::linux_sandbox::ensure_bwrap_support()
                     .map_err(SandboxExecutionError::Unsupported)?;
-                self.spawn_transformed_with_stdio()
+                self.spawn_transformed_with_stdio(process_group)
             }
             #[cfg(target_os = "macos")]
-            SandboxType::MacosSeatbelt => self.spawn_transformed_with_stdio(),
+            SandboxType::MacosSeatbelt => self.spawn_transformed_with_stdio(process_group),
             SandboxType::None => Err(SandboxExecutionError::Unsupported(
                 "unprotected execution is not available through SandboxExecRequest".to_string(),
             )),
@@ -366,21 +388,24 @@ impl SandboxExecRequest {
             .map_err(SandboxExecutionError::Io)
     }
 
-    fn spawn_transformed_with_stdio(&self) -> Result<Child, SandboxExecutionError> {
-        self.command_for_spawn_with_stdio()
+    fn spawn_transformed_with_stdio(
+        &self,
+        process_group: bool,
+    ) -> Result<Child, SandboxExecutionError> {
+        self.command_for_spawn_with_io(true, process_group)
             .spawn()
             .map_err(SandboxExecutionError::Io)
     }
 
     fn command_for_spawn(&self) -> Command {
-        self.command_for_spawn_with_io(false)
+        self.command_for_spawn_with_io(false, false)
     }
 
     fn command_for_spawn_with_stdio(&self) -> Command {
-        self.command_for_spawn_with_io(true)
+        self.command_for_spawn_with_io(true, false)
     }
 
-    fn command_for_spawn_with_io(&self, piped: bool) -> Command {
+    fn command_for_spawn_with_io(&self, piped: bool, process_group: bool) -> Command {
         let mut command = Command::new(&self.execution.command[0]);
         command
             .args(&self.execution.command[1..])
@@ -401,6 +426,13 @@ impl SandboxExecRequest {
             Stdio::inherit()
         });
         command.env_clear();
+        #[cfg(unix)]
+        if process_group {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(not(unix))]
+        let _ = process_group;
         for (key, value) in &self.execution.env {
             if !is_unsafe_environment_key(key) {
                 command.env(key, value);
@@ -930,7 +962,7 @@ mod tests {
             .create_exec_request_with_read_only_roots(command, policy, vec![toolchain_root])
             .unwrap();
 
-        let mut child = request.spawn_with_stdio().unwrap();
+        let mut child = request.spawn_with_stdio_in_process_group().unwrap();
         let mut stdin = child.stdin.take().expect("stdin should be piped");
         assert!(child.stdout.is_some(), "stdout should be piped");
         assert!(child.stderr.is_some(), "stderr should be piped");
@@ -1354,7 +1386,14 @@ mod tests {
 
         let mut request = request_for_process_tests("/bin/cat", SandboxType::LinuxSeccomp);
         request.execution.command.push("-".into());
-        let mut child = request.command_for_spawn_with_stdio().spawn().unwrap();
+        let mut child = request
+            .command_for_spawn_with_io(true, true)
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::getpgid(child.id() as libc::pid_t) },
+            child.id() as libc::pid_t
+        );
         let mut stdin = child.stdin.take().expect("stdin should be piped");
         assert!(child.stdout.is_some(), "stdout should be piped");
         assert!(child.stderr.is_some(), "stderr should be piped");
