@@ -1016,3 +1016,70 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod native_windows_tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn restricted_token_process_launches_native_command() {
+        let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let result = unsafe {
+            execute_with_restricted_token(
+                &program.to_string_lossy(),
+                &["/c".into(), "exit 0".into()],
+                &WindowsSandboxPolicy::default(),
+            )
+        };
+
+        assert!(result.is_ok(), "restricted-token launch failed: {result:?}");
+    }
+
+    #[test]
+    fn unsupported_protected_policies_fail_closed_before_launch() {
+        let cwd = std::env::current_dir().unwrap();
+        let command = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("missing-sandbox-command.exe");
+        let policies = [
+            WindowsSandboxPolicy {
+                read_allow: vec![cwd.clone()],
+                write_deny: Vec::new(),
+                network_allowed: true,
+                use_private_desktop: false,
+            },
+            WindowsSandboxPolicy {
+                read_allow: Vec::new(),
+                write_deny: Vec::new(),
+                network_allowed: false,
+                use_private_desktop: false,
+            },
+        ];
+
+        for policy in policies {
+            let result = execute_sandboxed_command(
+                &command.to_string_lossy(),
+                &[],
+                &cwd,
+                &HashMap::new(),
+                &policy,
+                None,
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn native_acl_entrypoint_reports_unimplemented_enforcement() {
+        let root =
+            std::env::temp_dir().join(format!("ai-sandbox-windows-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let result = unsafe { apply_acl_restrictions(&root, &["S-1-1-0".into()], &[]) };
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+}

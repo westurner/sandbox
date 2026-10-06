@@ -544,20 +544,146 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_network_policies_fail_closed() {
-        let result = create_readonly_bwrap_command(
-            vec!["true".to_string()],
-            Path::new("/tmp"),
+    fn readonly_builder_validates_skips_and_deduplicates_roots() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ai-sandbox-roots-{suffix}"));
+        let cwd = root.join("workspace");
+        let nested = cwd.join("nested");
+        let tool_a = root.join("tools").join("a");
+        let tool_b = root.join("tools").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&tool_a).unwrap();
+        std::fs::create_dir_all(&tool_b).unwrap();
+
+        let mut roots = vec![
+            cwd.clone(),
+            nested,
+            tool_a.clone(),
+            tool_a.clone(),
+            tool_b.clone(),
+        ];
+        if Path::new("/usr").exists() {
+            roots.push(PathBuf::from("/usr"));
+        }
+        let args = create_readonly_bwrap_command_with_roots(
+            vec!["true".into()],
+            &cwd,
+            &roots,
             &[],
-            crate::NetworkSandboxPolicy::Localhost,
+            crate::NetworkSandboxPolicy::NoAccess,
+        )
+        .unwrap();
+        let tool_a = tool_a
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let tool_b = tool_b
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let shared_parent = root.join("tools").canonicalize().unwrap();
+        let shared_parent = shared_parent.to_string_lossy();
+        assert_eq!(
+            args.windows(3)
+                .filter(|parts| *parts == ["--ro-bind", tool_a.as_str(), tool_a.as_str()])
+                .count(),
+            1
         );
+        assert!(args
+            .windows(3)
+            .any(|parts| parts == ["--ro-bind", tool_b.as_str(), tool_b.as_str()]));
+        assert_eq!(
+            args.windows(2)
+                .filter(|parts| *parts == ["--dir", shared_parent.as_ref()])
+                .count(),
+            1
+        );
+        if Path::new("/usr").exists() {
+            assert_eq!(
+                args.windows(3)
+                    .filter(|parts| *parts == ["--ro-bind", "/usr", "/usr"])
+                    .count(),
+                1
+            );
+        }
 
         assert!(matches!(
-            result,
-            Err(BwrapBuildError::UnsupportedNetworkPolicy(
-                crate::NetworkSandboxPolicy::Localhost
-            ))
+            create_readonly_bwrap_command_with_roots(
+                vec!["true".into()],
+                &cwd,
+                &[PathBuf::from("relative")],
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::UnsupportedFilesystemPolicy(_))
         ));
+        assert!(matches!(
+            create_readonly_bwrap_command_with_roots(
+                vec!["true".into()],
+                &cwd,
+                &[PathBuf::from("/tmp/../tmp")],
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::UnsupportedFilesystemPolicy(_))
+        ));
+        assert!(matches!(
+            create_readonly_bwrap_command_with_roots(
+                vec!["true".into()],
+                &cwd,
+                &[PathBuf::from("/")],
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::ReadOnlyFilesystemRoot)
+        ));
+        assert!(matches!(
+            create_readonly_bwrap_command_with_roots(
+                vec!["true".into()],
+                &cwd,
+                std::slice::from_ref(&root),
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::ReadOnlyRootContainsWorkspace(_))
+        ));
+        assert!(matches!(
+            create_readonly_bwrap_command_with_roots(
+                vec!["true".into()],
+                &cwd,
+                &[root.join("missing")],
+                &[],
+                crate::NetworkSandboxPolicy::NoAccess,
+            ),
+            Err(BwrapBuildError::MissingMountPath(_))
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_unsupported_network_policies_fail_closed() {
+        for network in [
+            crate::NetworkSandboxPolicy::Localhost,
+            crate::NetworkSandboxPolicy::Proxy,
+        ] {
+            assert!(matches!(
+                create_readonly_bwrap_command(
+                    vec!["true".to_string()],
+                    Path::new("/tmp"),
+                    &[],
+                    network,
+                ),
+                Err(BwrapBuildError::UnsupportedNetworkPolicy(policy)) if policy == network
+            ));
+        }
     }
 
     #[test]
@@ -594,6 +720,18 @@ mod tests {
             .windows(3)
             .any(|parts| parts == ["--setenv", "PATH", "/usr/bin"]));
 
+        let full_access_workspace = create_workspace_bwrap_command(
+            vec!["true".into()],
+            &cwd,
+            &[],
+            &[],
+            crate::NetworkSandboxPolicy::FullAccess,
+        )
+        .unwrap();
+        assert!(!full_access_workspace
+            .iter()
+            .any(|arg| arg == "--unshare-net"));
+
         let writable_workspace = create_workspace_bwrap_command(
             vec!["true".into()],
             &cwd,
@@ -616,6 +754,24 @@ mod tests {
             ),
             Err(BwrapBuildError::UnsupportedNetworkPolicy(
                 crate::NetworkSandboxPolicy::Localhost
+            ))
+        ));
+        assert!(create_full_access_bwrap_command(
+            vec!["true".into()],
+            &cwd,
+            &[],
+            crate::NetworkSandboxPolicy::FullAccess,
+        )
+        .is_ok());
+        assert!(matches!(
+            create_full_access_bwrap_command(
+                vec!["true".into()],
+                &cwd,
+                &[],
+                crate::NetworkSandboxPolicy::Proxy,
+            ),
+            Err(BwrapBuildError::UnsupportedNetworkPolicy(
+                crate::NetworkSandboxPolicy::Proxy
             ))
         ));
 
@@ -670,5 +826,22 @@ mod tests {
             result,
             Err(BwrapBuildError::WritableFilesystemRoot(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_mount_paths_are_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+        std::fs::create_dir_all(&path).unwrap();
+        let result = create_readonly_bwrap_command(
+            vec!["true".into()],
+            &path,
+            &[],
+            crate::NetworkSandboxPolicy::NoAccess,
+        );
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(matches!(result, Err(BwrapBuildError::InvalidMountPath(_))));
     }
 }

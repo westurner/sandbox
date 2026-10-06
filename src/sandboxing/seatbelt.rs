@@ -481,4 +481,40 @@ mod tests {
         assert!(!is_loopback_host("[2001:db8::1]"));
         assert!(!is_loopback_host("::1.attacker.example"));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_seatbelt_readonly_policy_denies_file_creation() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-sandbox-seatbelt-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let denied_path = directory.join("denied-write");
+        let args = create_seatbelt_command_args_for_policies(
+            vec![
+                "/usr/bin/touch".into(),
+                denied_path.to_string_lossy().into_owned(),
+            ],
+            &super::super::FileSystemSandboxPolicy::ReadOnly,
+            super::super::NetworkSandboxPolicy::NoAccess,
+            &directory,
+            false,
+            None,
+        )
+        .unwrap();
+        let output = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE)
+            .args(args)
+            .output()
+            .expect("sandbox-exec should be available on macOS");
+
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Operation not permitted"));
+        assert!(!denied_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

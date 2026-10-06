@@ -87,12 +87,12 @@ trait PledgeApi {
 }
 
 fn enforce_pledge(api: &impl PledgeApi, promises: &PledgePromises) -> std::io::Result<()> {
-    let promise_string = promises.to_pledge_string();
-    let promise_cstr = std::ffi::CString::new(promise_string).map_err(|_| {
+    let exec_handoff =
+        std::ffi::CString::new("stdio rpath exec").expect("static pledge promises are valid");
+    let exec_promises = std::ffi::CString::new(promises.to_pledge_string()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pledge promises")
     })?;
-    let empty_cstr = std::ffi::CString::new("").expect("empty CString is valid");
-    api.pledge(promise_cstr.as_c_str(), empty_cstr.as_c_str())
+    api.pledge(exec_handoff.as_c_str(), exec_promises.as_c_str())
 }
 
 #[cfg(target_os = "openbsd")]
@@ -132,7 +132,7 @@ impl PledgePromises {
             id: false,
             chown: false,
             flock: false,
-            tmppath: true,
+            tmppath: false,
             error: true,
         }
     }
@@ -308,8 +308,43 @@ pub fn is_pledge_available() -> bool {
 
 #[cfg(target_os = "freebsd")]
 mod freebsd_impl {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
+
+    extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+
+    fn open_executable(program: &str) -> std::io::Result<File> {
+        let candidates = if program.contains('/') {
+            vec![PathBuf::from(program)]
+        } else {
+            let path = std::env::var_os("PATH")
+                .unwrap_or_else(|| std::ffi::OsString::from("/bin:/usr/bin:/usr/local/bin"));
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(program))
+                .collect()
+        };
+        let mut last_error = None;
+        for candidate in candidates {
+            let path = CString::new(candidate.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+            })?;
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_EXEC) };
+            if fd >= 0 {
+                return Ok(unsafe { File::from_raw_fd(fd) });
+            }
+            last_error = Some(std::io::Error::last_os_error());
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "executable not found")
+        }))
+    }
 
     /// Execute a command with capsicum sandbox
     pub fn execute_with_capsicum(
@@ -327,6 +362,22 @@ mod freebsd_impl {
             return cmd.spawn();
         }
 
+        let executable = open_executable(program)?;
+        let executable_fd = executable.as_raw_fd();
+        let argv_storage = std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "argument contains NUL")
+            })?;
+        let argv_pointers = argv_storage
+            .iter()
+            .map(|argument| argument.as_ptr() as usize)
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         let mut cmd = Command::new(program);
         cmd.args(args);
         cmd.stdin(Stdio::inherit());
@@ -334,10 +385,28 @@ mod freebsd_impl {
         cmd.stderr(Stdio::inherit());
 
         unsafe {
-            cmd.pre_exec(|| super::enforce_capsicum(&super::NativeCapsicumApi));
+            cmd.pre_exec(move || {
+                let _argv_storage = &argv_storage;
+                let flags = libc::fcntl(executable_fd, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(executable_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                super::enforce_capsicum(&super::NativeCapsicumApi)?;
+                let argv = argv_pointers.as_ptr() as *const *const libc::c_char;
+                let envp = environ as *const *const libc::c_char;
+                if libc::fexecve(executable_fd, argv, envp) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Err(std::io::Error::other("fexecve returned without executing"))
+                }
+            });
         }
 
-        cmd.spawn()
+        let result = cmd.spawn();
+        drop(executable);
+        result
     }
 }
 
@@ -502,7 +571,14 @@ mod tests {
 
         let pledge = MockPledgeApi::default();
         enforce_pledge(&pledge, &PledgePromises::default_safe()).unwrap();
-        assert_eq!(pledge.execpromises.borrow().as_deref(), Some(""));
+        assert_eq!(
+            pledge.promises.borrow().as_deref(),
+            Some("stdio rpath exec")
+        );
+        assert_eq!(
+            pledge.execpromises.borrow().as_deref(),
+            Some("stdio rpath error")
+        );
     }
 
     // ============================================================================
@@ -635,11 +711,67 @@ mod tests {
 
         let error = enforce_pledge(&api, &PledgePromises::default_safe()).unwrap_err();
 
+        assert_eq!(api.promises.borrow().as_deref(), Some("stdio rpath exec"));
         assert_eq!(
-            api.promises.borrow().as_deref(),
-            Some("stdio rpath tmppath error")
+            api.execpromises.borrow().as_deref(),
+            Some("stdio rpath error")
         );
-        assert_eq!(api.execpromises.borrow().as_deref(), Some(""));
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod native_freebsd_tests {
+    use super::{execute_with_capsicum, CapsicumLevel};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn capsicum_command_cannot_create_a_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-sandbox-capsicum-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let denied_path = directory.join("denied-write");
+        let mut child = execute_with_capsicum(
+            "/usr/bin/touch",
+            &[denied_path.to_string_lossy().into_owned()],
+            CapsicumLevel::Basic,
+        )
+        .expect("the Capsicum child should execute through its pre-opened descriptor");
+        let status = child.wait().unwrap();
+
+        assert_eq!(status.code(), Some(1));
+        assert!(!denied_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "openbsd"))]
+mod native_openbsd_tests {
+    use super::{execute_with_pledge, PledgePromises};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pledge_command_cannot_create_a_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("ai-sandbox-pledge-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let denied_path = directory.join("denied-write");
+        let mut child = execute_with_pledge(
+            "/usr/bin/touch",
+            &[denied_path.to_string_lossy().into_owned()],
+            &PledgePromises::default_safe(),
+        )
+        .expect("the pledge child should complete the exec handoff");
+        let status = child.wait().unwrap();
+
+        assert_eq!(status.code(), Some(1));
+        assert!(!denied_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -27,14 +27,16 @@ cargo +nightly llvm-cov report --json --output-path target/ai-sandbox-coverage.j
 
 ## Current Linux Checkpoint
 
-Measured during the coverage work in this checkout:
+Measured after the current Linux coverage work:
 
-- Library-only: 307/328 branch outcomes covered (93.60%).
-- All targets: 312/362 branch outcomes covered (86.19%).
-- All-target tests: 158 library tests and 4 CLI integration tests passed.
-- BSD pledge serialization and the Bubblewrap builder/finder seams are covered
-  on Linux; a duplicate directory restriction check in the allow-rule pass was
-  removed after the earlier deny-rule pass was confirmed to enforce it.
+- Library-only: 387/450 branch outcomes covered (86.00%).
+- All targets: 392/484 branch outcomes covered (80.99%).
+- All-target tests: 168 library tests and 4 CLI integration tests passed.
+- Bubblewrap tests cover unsupported Proxy/Localhost policies, read-only root
+  validation, workspace/system-root skips, duplicate roots and shared parents,
+  and non-UTF-8 mount paths.
+- OpenBSD pledge now performs the exec handoff with `execpromises` and omits the
+  removed `tmppath` promise from its default policy.
 
 These are a checkpoint, not a 100% result. Coverage can change as tests or
 compiler instrumentation change; rerun the commands above before updating this
@@ -43,16 +45,21 @@ several associated with platform-gated code or host/kernel-dependent paths.
 
 ## Remaining Platform Work
 
-- Linux: add tests for the unexecuted Bubblewrap capability-probe outcomes and
-  remaining builder/policy combinations; the host has `bwrap`, but namespace
-  support may be unavailable.
-- macOS: exercise Seatbelt proxy parsing edge outcomes and real
-  `sandbox-exec` integration on a native runner.
-- Windows: cover protected-directory filtering and Windows process/token/ACL
-  code on a Windows runner.
-- FreeBSD/OpenBSD: test Capsicum/pledge native enforcement APIs on their
-  respective runners. Linux can only cover their policy serialization and
-  unsupported-platform adapters.
+- Linux: builder and policy coverage is expanded. Kernel-dependent Bubblewrap
+  behavior still depends on host namespace support and must not be inferred
+  from argument-builder tests.
+- macOS: a native `sandbox-exec` test now verifies that a read-only policy
+  denies file creation; it runs on the existing macOS CI runner.
+- Windows: native tests exercise restricted-token process creation and verify
+  unsupported ACL/network policies fail closed. Filesystem ACL and network
+  enforcement are not implemented, so this does not claim those controls are
+  enforced.
+- FreeBSD/OpenBSD: native tests verify a real child cannot create a file under
+  Capsicum/pledge. Dedicated VM jobs were added; they are the runtime checks
+  because this Linux host cannot execute either kernel API.
+
+Cross-platform runtime results must be recorded from their native CI jobs; the
+Linux checkpoint above only reports locally executed tests.
 
 Do not force coverage through fabricated error paths where a native platform
 API or kernel capability is required. Prefer injectable adapters for behavior
