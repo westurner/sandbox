@@ -543,6 +543,46 @@ mod tests {
         std::fs::remove_dir_all(tool_root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_builder_handles_sibling_roots_under_home_directory() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for tests"));
+        let base = home.join(format!("ai-sandbox-home-roots-{suffix}"));
+        let cwd = base.join("workspace");
+        let toolchain = base.join("tools").join("stable");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&toolchain).unwrap();
+
+        let result = create_readonly_bwrap_command_with_roots(
+            vec!["/usr/bin/true".into()],
+            &cwd,
+            std::slice::from_ref(&toolchain),
+            &[],
+            crate::NetworkSandboxPolicy::NoAccess,
+        );
+        let expected_toolchain = toolchain
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&base).unwrap();
+        let args = result.unwrap();
+        assert!(args.windows(3).any(|parts| {
+            parts
+                == [
+                    "--ro-bind",
+                    expected_toolchain.as_str(),
+                    expected_toolchain.as_str(),
+                ]
+        }));
+    }
+
     #[test]
     fn readonly_builder_validates_skips_and_deduplicates_roots() {
         use std::time::{SystemTime, UNIX_EPOCH};

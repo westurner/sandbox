@@ -1485,6 +1485,29 @@ mod tests {
         assert!(
             !unrestricted.contains_bypass_attempt(&["/work/tree/sub/file".into()], "/work/tree")
         );
+        assert!(unrestricted.contains_bypass_attempt(&["--output=../outside".into()], "/work/tree"));
+        assert!(!unrestricted.contains_bypass_attempt(&["--output=relative".into()], "/work/tree"));
+        assert_eq!(
+            unrestricted
+                .check_with_cwd(&["cat".into()], Some("relative"))
+                .unwrap()
+                .decision,
+            Decision::Deny
+        );
+        assert!(!unrestricted
+            .contains_bypass_attempt(&["--output=/work/tree/file".into()], "/work/tree"));
+        assert!(directory_restriction_denies(
+            &PrefixRule::new(
+                PrefixPattern {
+                    first: Arc::from("cat"),
+                    rest: Vec::new(),
+                },
+                Decision::Allow,
+                None,
+            )
+            .with_directory_restriction(),
+            None,
+        ));
     }
 
     #[test]
@@ -2912,5 +2935,261 @@ mod tests {
         policy.add_path_rule_simple("/etc".to_string(), true, Decision::Deny, None);
         let debug_str = format!("{:?}", policy);
         assert!(debug_str.contains("path_rules_count"));
+    }
+
+    #[test]
+    fn path_helpers_cover_relative_and_root_escape_inputs() {
+        assert_eq!(normalize_absolute_path(Path::new("relative/path")), None);
+        assert_eq!(normalize_absolute_path(Path::new("/../../outside")), None);
+        assert_eq!(
+            normalize_absolute_path(Path::new("/tmp/../etc")),
+            Some(Path::new("/etc").to_path_buf())
+        );
+        assert_eq!(
+            normalize_absolute_path(Path::new("/tmp/./inside")),
+            Some(Path::new("/tmp/inside").to_path_buf())
+        );
+        assert!(!path_starts_with_case_insensitive(
+            Path::new("/"),
+            Path::new("/tmp")
+        ));
+        assert!(!path_starts_with_case_insensitive(
+            Path::new("/tmp-other/file"),
+            Path::new("/tmp")
+        ));
+
+        let relative_input = PathRule::new("/etc/passwd".into(), false, Decision::Deny, None);
+        assert!(!relative_input.matches_path("etc/passwd"));
+        let relative_pattern = PathRule::new("etc/passwd".into(), false, Decision::Deny, None);
+        assert!(!relative_pattern.matches_path("/etc/passwd"));
+        let wildcard_pattern = PathRule::new("/tmp/*".into(), true, Decision::Deny, None);
+        assert!(!wildcard_pattern.matches_path("relative/path"));
+        assert!(!wildcard_pattern.matches_path("/var/tmp/file"));
+        let root_wildcard = PathRule::new("/*".into(), true, Decision::Allow, None);
+        assert!(root_wildcard.matches_path("/tmp/nested"));
+    }
+
+    #[test]
+    fn network_rules_cover_exact_wildcard_port_and_default_decisions() {
+        let mut policy = Policy::new();
+        policy.add_network_rule(NetworkRule {
+            host: "example.com".into(),
+            port: Some(443),
+            protocol: NetworkRuleProtocol::Tcp,
+            decision: Decision::Deny,
+        });
+        policy.add_network_rule(NetworkRule {
+            host: "*".into(),
+            port: None,
+            protocol: NetworkRuleProtocol::Udp,
+            decision: Decision::Allow,
+        });
+
+        assert_eq!(
+            policy.check_network("example.com", Some(443)),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.check_network("example.com", Some(80)),
+            Decision::Allow
+        );
+        assert_eq!(policy.check_network("other.example", None), Decision::Allow);
+
+        let mut port_only = Policy::new();
+        port_only.add_network_rule(NetworkRule {
+            host: "*".into(),
+            port: Some(53),
+            protocol: NetworkRuleProtocol::Udp,
+            decision: Decision::Prompt,
+        });
+        assert_eq!(
+            port_only.check_network("dns.example", Some(53)),
+            Decision::Prompt
+        );
+        assert_eq!(
+            port_only.check_network("dns.example", Some(443)),
+            Decision::Prompt
+        );
+        assert_eq!(
+            Policy::new().check_network("unmatched.example", None),
+            Decision::Prompt
+        );
+    }
+
+    #[test]
+    fn allowed_prefixes_render_all_token_kinds_and_deduplicate() {
+        let mut policy = Policy::new();
+        let rule: Arc<dyn Rule> = Arc::new(PrefixRule {
+            pattern: PrefixPattern {
+                first: Arc::from("tool"),
+                rest: vec![
+                    PatternToken::Literal("literal".into()),
+                    PatternToken::Wildcard,
+                    PatternToken::Variable("HOME".into()),
+                ],
+            },
+            decision: Decision::Allow,
+            justification: None,
+            rule_type: RuleType::Whitelist,
+            allowed_directories: None,
+            restrict_to_directories: false,
+        });
+        let rules = policy.rules_by_program.entry("tool".into()).or_default();
+        rules.extend([rule.clone(), rule]);
+        policy
+            .add_prefix_rule_ext(
+                &["tool".into(), "denied".into()],
+                Decision::Deny,
+                None,
+                RuleType::Blacklist,
+                None,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            policy.get_allowed_prefixes(),
+            vec![vec![
+                String::from("tool"),
+                String::from("literal"),
+                String::from("*"),
+                String::from("$HOME"),
+            ]]
+        );
+        assert_eq!(Decision::Allow.to_string(), "allow");
+        assert_eq!(Decision::Deny.to_string(), "deny");
+        assert_eq!(Decision::Prompt.to_string(), "prompt");
+    }
+
+    #[test]
+    fn parse_policy_ignores_unrecognized_lines_and_adds_supported_rules() {
+        let policy = parse_policy(
+            "\n# comment\nunsupported(value = true)\nprefix_rule(pattern = [\"cmd\"], decision = \"allow\")\nprefix_rule(pattern = ['cmd'], decision ='allow')\nprefix_rule(pattern = [\"other\"], decision = \"allow\")\nprefix_rule(pattern = [\"cmd\"], decision = \"deny\")\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.get_allowed_prefixes(),
+            vec![vec![String::from("cmd")]]
+        );
+    }
+
+    #[test]
+    fn absolute_program_aliases_inherit_denies_but_not_allows() {
+        let mut deny = Policy::new();
+        deny.add_prefix_rule(&["tool".into()], Decision::Deny, None)
+            .unwrap();
+        deny.add_prefix_rule(&["other".into()], Decision::Deny, None)
+            .unwrap();
+        assert_eq!(
+            deny.check_with_cwd(&["/usr/bin/tool".into()], None)
+                .unwrap()
+                .decision,
+            Decision::Deny
+        );
+
+        let mut allow = Policy::new();
+        allow
+            .add_prefix_rule(&["tool".into()], Decision::Allow, None)
+            .unwrap();
+        assert!(allow
+            .check_with_cwd(&["/usr/bin/tool".into()], None)
+            .is_none());
+        assert!(allow.check_with_cwd(&["/".into()], None).is_none());
+    }
+
+    #[test]
+    fn matching_non_deny_rules_keep_the_first_result() {
+        let mut policy = Policy::new();
+        policy
+            .add_prefix_rule(
+                &["tool".into()],
+                Decision::Allow,
+                Some("first matching rule".into()),
+            )
+            .unwrap();
+        policy
+            .add_prefix_rule(
+                &["tool".into()],
+                Decision::Allow,
+                Some("later matching rule".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            policy
+                .check_with_cwd(&["tool".into()], None)
+                .unwrap()
+                .justification
+                .as_deref(),
+            Some("first matching rule")
+        );
+    }
+
+    #[test]
+    fn directory_restrictions_fail_closed_without_a_valid_allowlist() {
+        let rule = PrefixRule::new(
+            PrefixPattern {
+                first: Arc::from("tool"),
+                rest: Vec::new(),
+            },
+            Decision::Allow,
+            None,
+        )
+        .with_directory_restriction();
+
+        assert!(directory_restriction_denies(&rule, Some("/workspace")));
+        assert!(directory_restriction_denies(&rule, Some("relative")));
+
+        let invalid_allowlist = rule.with_allowed_directories(vec!["relative".into()]);
+        assert!(directory_restriction_denies(
+            &invalid_allowlist,
+            Some("/workspace")
+        ));
+    }
+
+    #[test]
+    fn wildcard_rules_skip_nonmatches_and_keep_the_first_matching_fallback() {
+        let mut policy = Policy::new();
+        policy
+            .add_prefix_rule(&["*".into(), "run".into()], Decision::Prompt, None)
+            .unwrap();
+        policy
+            .add_prefix_rule(
+                &["*".into(), "run".into(), "safe".into()],
+                Decision::Allow,
+                None,
+            )
+            .unwrap();
+        policy
+            .add_prefix_rule(&["*".into(), "other".into()], Decision::Deny, None)
+            .unwrap();
+
+        assert_eq!(
+            policy
+                .check_with_cwd(&["tool".into(), "run".into(), "safe".into()], None)
+                .unwrap()
+                .decision,
+            Decision::Prompt
+        );
+
+        let mut restricted = Policy::new();
+        restricted
+            .add_prefix_rule_ext(
+                &["*".into()],
+                Decision::Allow,
+                None,
+                RuleType::Whitelist,
+                Some(vec!["/workspace".into()]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            restricted
+                .check_with_cwd(&["tool".into()], Some("/outside"))
+                .unwrap()
+                .decision,
+            Decision::Deny
+        );
     }
 }

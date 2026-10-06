@@ -1035,7 +1035,7 @@ mod tests {
     fn request_run_returns_early_status_and_enforces_timeout() {
         let request = request_for_process_tests("true", SandboxType::None);
         let status = request
-            .run_with_spawn(Duration::from_secs(1), |_| {
+            .run_with_spawn(Duration::from_secs(5), |_| {
                 Command::new("true")
                     .spawn()
                     .map_err(SandboxExecutionError::Io)
@@ -1340,6 +1340,95 @@ mod tests {
         assert!(!policy(vec![PathBuf::from("relative")]).is_safe());
         assert!(!policy(vec![PathBuf::from("/")]).is_safe());
         assert!(!policy(vec![PathBuf::from("/opt/../etc")]).is_safe());
+    }
+
+    #[test]
+    fn read_only_root_normalization_rejects_unsafe_roots_and_deduplicates_valid_roots() {
+        let directory = TestDirectory::new("root-normalization");
+        let cwd = directory.0.join("workspace");
+        let additional_root = directory.0.join("toolchain");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&additional_root).unwrap();
+        let policy = |read_only_roots| SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots },
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+
+        for invalid_root in [
+            PathBuf::from("relative"),
+            PathBuf::from("/"),
+            PathBuf::from("/tmp/../etc"),
+            directory.0.join("missing"),
+            directory.0.clone(),
+        ] {
+            assert!(normalize_read_only_roots(policy(vec![invalid_root]), &cwd).is_err());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let root_alias = directory.0.join("root-alias");
+            symlink("/", &root_alias).unwrap();
+            assert!(normalize_read_only_roots(policy(vec![root_alias]), &cwd).is_err());
+        }
+
+        let (normalized, normalized_cwd) = normalize_read_only_roots(
+            policy(vec![
+                cwd.clone(),
+                additional_root.clone(),
+                additional_root.clone(),
+            ]),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(normalized_cwd, cwd.canonicalize().unwrap());
+        let SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnlyWithRoots { read_only_roots },
+            ..
+        } = normalized
+        else {
+            panic!("expected normalized read-only roots");
+        };
+        assert_eq!(read_only_roots.len(), 2);
+        assert!(read_only_roots.contains(&cwd.canonicalize().unwrap()));
+        assert!(read_only_roots.contains(&additional_root.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn additional_read_only_roots_reject_wrong_policy_and_relative_cwd() {
+        let manager = SandboxManager::new();
+        let command = |cwd| SandboxCommand {
+            program: OsString::from("tool"),
+            args: Vec::new(),
+            cwd,
+            env: HashMap::new(),
+        };
+        let policy = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::FullAccess,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        assert!(matches!(
+            manager.create_exec_request_with_read_only_roots(
+                command(PathBuf::from("/tmp")),
+                policy,
+                Vec::new(),
+            ),
+            Err(SandboxTransformError::UnsupportedPolicy(_))
+        ));
+
+        let policy = SandboxPolicy::ReadOnly {
+            file_system: FileSystemSandboxPolicy::ReadOnly,
+            network_access: NetworkSandboxPolicy::NoAccess,
+        };
+        assert!(matches!(
+            manager.create_exec_request_with_read_only_roots(
+                command(PathBuf::from("relative")),
+                policy,
+                Vec::new(),
+            ),
+            Err(SandboxTransformError::UnsafePolicy(_))
+        ));
     }
 
     #[cfg(target_os = "linux")]

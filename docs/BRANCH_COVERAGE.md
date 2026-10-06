@@ -29,19 +29,25 @@ cargo +nightly llvm-cov report --json --output-path target/ai-sandbox-coverage.j
 
 Measured after the current Linux coverage work:
 
-- Library-only: 387/450 branch outcomes covered (86.00%).
-- All targets: 392/484 branch outcomes covered (80.99%).
-- All-target tests: 168 library tests and 4 CLI integration tests passed.
+- Library-only: 447/478 branch outcomes covered (93.51%).
+- All targets: 452/486 branch outcomes covered (93.00%).
+- All-target tests: 180 library tests and 4 CLI integration tests passed.
 - Bubblewrap tests cover unsupported Proxy/Localhost policies, read-only root
   validation, workspace/system-root skips, duplicate roots and shared parents,
-  and non-UTF-8 mount paths.
+  sibling roots beneath the current home directory, and non-UTF-8 mount paths.
+- Execution-policy tests cover absolute executable aliases, directory bypass
+  inputs, invalid path roots, network matching, and wildcard-rule fallback.
+- Portable Seatbelt policy generation and Windows allow/deny path planning each
+  reach 100% branch coverage in this Linux report; this does not replace native
+  enforcement tests.
 - OpenBSD pledge now performs the exec handoff with `execpromises` and omits the
   removed `tmppath` promise from its default policy.
 
 These are a checkpoint, not a 100% result. Coverage can change as tests or
 compiler instrumentation change; rerun the commands above before updating this
-table. The current all-target report has 50 uncovered branch outcomes, with
-several associated with platform-gated code or host/kernel-dependent paths.
+table. The current all-target report has 34 uncovered branch outcomes, with
+several associated with platform-gated code, host filesystem layout, or
+kernel-dependent paths.
 
 ## Remaining Platform Work
 

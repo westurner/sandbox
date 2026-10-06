@@ -859,6 +859,16 @@ mod tests {
         let (allow, _deny) = compute_allow_deny_paths(&policy, Path::new("/tmp"));
 
         assert!(allow.iter().any(|p| p == Path::new("/tmp")));
+
+        let (allow_with_cwd, _) = compute_allow_deny_paths(&policy, Path::new("/workspace"));
+        assert!(allow_with_cwd.iter().any(|path| path == Path::new("/tmp")));
+        assert_eq!(
+            allow_with_cwd
+                .iter()
+                .filter(|path| *path == Path::new("/workspace"))
+                .count(),
+            1
+        );
     }
 
     #[test]

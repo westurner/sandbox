@@ -327,6 +327,23 @@ mod tests {
     }
 
     #[test]
+    fn readonly_roots_reject_relative_root_filesystem_root_and_traversal() {
+        for root in ["relative", "/", "/workspace/../outside"] {
+            let policy = super::super::SandboxPolicy::ReadOnly {
+                file_system: super::super::FileSystemSandboxPolicy::ReadOnlyWithRoots {
+                    read_only_roots: vec![Path::new(root).to_path_buf()],
+                },
+                network_access: super::super::NetworkSandboxPolicy::NoAccess,
+            };
+
+            assert!(matches!(
+                create_seatbelt_policy(&policy),
+                Err(SeatbeltPolicyError::InvalidReadOnlyRoot(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_proxy_loopback_ports() {
         let mut env = HashMap::new();
         env.insert(
@@ -357,6 +374,7 @@ mod tests {
             ("HTTP_PROXY".into(), "  ".into()),
             ("HTTPS_PROXY".into(), "http://0.0.0.0:8080".into()),
             ("ALL_PROXY".into(), "http://example.com:1080".into()),
+            ("all_proxy".into(), "file:///tmp/proxy".into()),
         ]);
         assert!(proxy_loopback_ports_from_env(&ignored).is_empty());
     }
